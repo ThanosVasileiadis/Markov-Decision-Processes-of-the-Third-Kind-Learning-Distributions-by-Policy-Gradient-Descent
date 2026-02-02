@@ -1,0 +1,409 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from math import pi
+import torch, gc
+
+gc.collect()
+torch.cuda.empty_cache()
+
+# ─────────── General settings  ───────────
+T = 1  # one period
+R = 1.0  # amplitude in r = R cos(s0 + a + xi)
+s0 = 0.0  # phase offset
+sigma = 0.20  # noise std for xi
+M = 72 * 1024  # trajectories per epoch
+W = 100.0  # frequency cutoff
+N_omega = 8001  # grid size for CF (odd is nice)
+alpha = 0.015  # kernel bandwidth for CF loss weights
+epochs = 2000
+lr = 1e-3
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+Kmax = 16
+
+# ===================== Save figure helper =====================
+SAVE_FIGS = True
+FIG_DIR = "figures"
+import os
+
+os.makedirs(FIG_DIR, exist_ok=True)
+
+
+def savefig(name, dpi=300):
+    path = os.path.join(FIG_DIR, f"{name}.png")
+    plt.savefig(path, dpi=dpi, bbox_inches='tight')
+    print(f"[saved] {path}")
+
+
+# ─────────── Build frequency grid & kernel weights ───────────
+omega_np = np.linspace(-W, W, N_omega)  # (N_omega,)
+omega_grid = torch.tensor(omega_np, device=device, dtype=torch.float32).reshape(-1, 1)  # (N_omega,1)
+K_w = torch.exp(-alpha * omega_grid.flatten() ** 2)  # (N_omega,)
+Δω = float(2 * W / (N_omega - 1))
+
+
+# ─────────── Epanechnikov target CF φ_E(ω) (real) ───────────
+def phi_epanechnikov_np(omega, R):
+    out = np.empty_like(omega, dtype=float)
+    small = np.isclose(omega, 0.0)
+    out[small] = 1.0
+    w = omega[~small]
+    out[~small] = (3.0 / (R ** 3 * w ** 3)) * (np.sin(w * R) - (w * R) * np.cos(w * R))
+    return out
+
+
+phiE_real_np = phi_epanechnikov_np(omega_np, R)  # real
+phi_target_vals = torch.tensor(phiE_real_np, device=device, dtype=torch.complex64)  # imag=0 target
+
+
+class ImplicitPolicy(nn.Module):
+    def __init__(self, hidden_dim: int = 256, n_blocks: int = 2):
+        super().__init__()
+        # input: x (1) + J (1) + z (1) + tau (1) = 4
+        self.input_layer = nn.Linear(4, hidden_dim)
+        self.input_ln = nn.LayerNorm(hidden_dim)
+        self.blocks = nn.ModuleList([
+            nn.ModuleDict({
+                'fc': nn.Linear(hidden_dim, hidden_dim),
+                'ln': nn.LayerNorm(hidden_dim),
+            }) for _ in range(n_blocks)
+        ])
+        self.output_layer = nn.Linear(hidden_dim, 1)
+
+        # --- Important in Option 1: avoid tanh saturation at init ---
+        nn.init.zeros_(self.output_layer.weight)
+        nn.init.zeros_(self.output_layer.bias)
+
+        # learnable temperature (keeps tanh in its linear region early on)
+        self.squash_scale = nn.Parameter(torch.tensor(0.5))  # start < 1
+
+    def forward(self, x, J, z, tau):
+        h = torch.cat([x, J, z, tau], dim=-1)
+        h = F.relu(self.input_ln(self.input_layer(h)))
+        for block in self.blocks:
+            r = h
+            h = F.relu(block['ln'](block['fc'](h)))
+            h = h + r
+
+        raw = self.output_layer(h)  # R-valued
+
+        return raw
+
+
+policy = ImplicitPolicy().to(device)
+optimizer = optim.Adam(policy.parameters(), lr=lr)
+
+
+# ─────────── One-period dynamics / "reward" transition ───────────
+# J will accumulate a single cost equal to r = R cos(s0 + a + xi)
+def step_one_period(x, a):
+    eps = torch.randn_like(a)  # xi
+    r = R * torch.cos(s0 + a + sigma * eps)  # scalar reward/cost
+    x_next = x  # no state evolution needed
+    cost = r
+    return x_next, cost
+
+
+# ─────────── Training loop (CF matching to Epanechnikov) ───────────
+for epoch in range(epochs):
+    x = torch.zeros(M, 1, device=device)
+    J = torch.zeros(M, 1, device=device)
+
+    for t in range(T):  # T=1, but keep the structure
+        z = torch.randn(M, 1, device=device)
+        x_in = x  # no normalization needed, but keep same inputs
+        J_in = J
+        tau = torch.full((M, 1), float((T - t) / T), device=device)  # =1.0 at t=0
+
+        a = policy(x_in, J_in, z, tau)
+
+        x, c = step_one_period(x, a)
+        J += c
+
+    # empirical CF of learned one-period return r (=J)
+    Jt = J.t()  # (1,M)
+    exp_t = torch.exp(1j * (omega_grid @ Jt))  # (N_omega, M)
+    phi_hat = exp_t.mean(dim=1)  # (N_omega,)
+    # ---------- CF loss on rewards ----------
+    rd = (phi_hat.real - phi_target_vals.real)
+    id = phi_hat.imag
+    loss = Δω * torch.sum(K_w * (rd ** 2 + 5 * id ** 2))
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    if epoch % 50 == 0:
+        print('J median/99p:', J.detach().abs().median().item(),
+              J.detach().abs().quantile(0.99).item())
+        print('J mean/median:', J.mean().item(), J.median().item())
+        print(f"Epoch {epoch:3d} | loss = {loss.item():.6f}")
+
+    if loss.item() < 1e-4:
+        print(f"Early stopping at epoch {epoch:3d} | loss = {loss.item():.6e}")
+        break
+
+
+# ─────────── Post-training evaluation ───────────
+@torch.no_grad()
+def estimate_phi(policy, n_traj=8192):
+    x = torch.zeros(n_traj, 1, device=device)
+    J = torch.zeros(n_traj, 1, device=device)
+    for t in range(T):  # T=1
+        z = torch.randn(n_traj, 1, device=device)
+        tau = torch.full((n_traj, 1), float((T - t) / T), device=device)
+        a = policy(x, J, z, tau)
+        x, c = step_one_period(x, a)
+        J += c
+    exp_t = torch.exp(1j * (omega_grid @ J.t()))
+    return exp_t.mean(dim=1).cpu().numpy(), J.squeeze().cpu().numpy()
+
+
+phi_learned, learned_returns = estimate_phi(policy)
+
+# ─── Plot CFs: real & imag separately ───
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+ax1.plot(omega_np, phiE_real_np, '--', label="Target Re φ_E")
+ax1.plot(omega_np, phi_learned.real, label="Learned Re φ")
+# plt.title("Real and Imaginary parts of characteristic function")
+ax1.set_ylabel("Re φ(ω)");
+ax1.legend();
+ax1.grid(True)
+ax2.plot(omega_np, np.zeros_like(omega_np), '--', label="Target Im 0")
+ax2.plot(omega_np, phi_learned.imag, label="Learned Im φ")
+ax2.set_xlabel("ω");
+ax2.set_ylabel("Im φ(ω)");
+ax2.legend();
+ax2.grid(True)
+plt.tight_layout();
+savefig("cf_match");
+plt.show()
+
+# ─── Show learned r-distribution against theoretical Epanechnikov PDF of r∈[-R,R] ───
+plt.figure(figsize=(8, 4))
+sns.histplot(learned_returns, bins=120, stat='density', label='Learned r', alpha=0.6)
+
+# Epanechnikov density on [-R,R]: f(r) = 3/(4R) * (1 - (r/R)^2)_+
+r_plot = np.linspace(-R, R, 1000)
+f_epan = (3.0 / (4.0 * R)) * np.maximum(0.0, 1.0 - (r_plot / R) ** 2)
+plt.plot(r_plot, f_epan, label='Target Epanechnikov PDF', linewidth=2)
+# plt.title("One-period return r distribution")
+plt.xlabel("Rewards");
+plt.ylabel("density")
+plt.legend();
+plt.grid(True);
+plt.tight_layout();
+savefig("return_distribution");
+plt.show()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMPARISON: action distribution (policy) vs numerical solver (Eq. 10)
+# ─────────────────────────────────────────────────────────────────────────────
+
+from scipy.special import jv
+
+
+# --- 1) Numerical solver for ψ_A(k) via Eq. (10) (least squares) ---
+def solve_eq10_psiA(R, s0, sigma, W, N_omega, Kmax, enforce_real=False):
+    omega = np.linspace(-W, W, N_omega)
+
+    # φ_E(ω) as before (real target)
+    def phi_epan(omega, R):
+        out = np.empty_like(omega, dtype=float)
+        small = np.isclose(omega, 0.0)
+        out[small] = 1.0
+        w = omega[~small]
+        out[~small] = (3.0 / (R ** 3 * w ** 3)) * (np.sin(w * R) - (w * R) * np.cos(w * R))
+        return out
+
+    phiE = phi_epan(omega, R)  # (L,)
+    J0 = jv(0, omega * R)  # (L,)
+    bprime = phiE - J0
+
+    # A[ℓ,k] = 2 J_k(ωℓ R) e^{-0.5 k^2 σ^2}, k=1..Kmax
+    L = N_omega
+    A = np.zeros((L, Kmax), dtype=float)
+    atten = np.exp(-0.5 * (np.arange(1, Kmax + 1) ** 2) * (sigma ** 2))
+    for k in range(1, Kmax + 1):
+        A[:, k - 1] = 2.0 * jv(k, omega * R) * atten[k - 1]
+
+    # least squares for x_k
+    x, *_ = np.linalg.lstsq(A, bprime, rcond=None)
+
+    # ψ_A(k) = i^{-k} e^{-ik s0} x_k  (k ≥ 1), ψ_A(0)=1
+    def i_pow_minus_k(k):
+        r = k % 4
+        return (1.0 + 0.0j) if r == 0 else (-1j if r == 1 else (-1.0 + 0.0j if r == 2 else 1j))
+
+    psiA = np.zeros(Kmax + 1, dtype=np.complex128)
+    psiA[0] = 1.0 + 0.0j
+    for k in range(1, Kmax + 1):
+        psi = i_pow_minus_k(k) * np.exp(-1j * k * s0) * x[k - 1]
+        if enforce_real:  # enforce symmetry of a on the circle
+            psi = np.real(psi) + 0j
+        # project |ψ_A(k)| ≤ 1 for numerical safety
+        m = np.abs(psi)
+        if m > 1.0:
+            psi /= m
+        psiA[k] = psi
+    return omega, psiA
+
+
+omega_solve, psiA_solver = solve_eq10_psiA(R, s0, sigma, W, N_omega, Kmax, enforce_real=False)
+
+
+# --- 2) Circular density p(θ) from ψ_A and sampling helper ---
+def circular_density_from_psiA(psiA, theta_grid):
+    # p(θ) = 1/(2π) [1 + 2 Σ_{k=1..K} Re( ψ_A(k) e^{-ikθ} )]
+    Kmax = len(psiA) - 1
+    ks = np.arange(1, Kmax + 1)[:, None]  # (K,1)
+    exp_term = np.exp(-1j * ks * theta_grid[None, :])  # (K, Nθ)
+    p = (1.0 / (2 * np.pi)) * (1.0 + 2.0 * np.real((psiA[1:, None] * exp_term).sum(axis=0)))
+    p = np.maximum(p, 0.0)  # avoid tiny negatives
+    # renormalize on the circle
+    Z = np.trapz(p, theta_grid)
+    if Z > 0:
+        p /= Z
+    else:
+        p[:] = 1.0 / (theta_grid[-1] - theta_grid[0])
+    return p
+
+
+def sample_from_circular_density(theta_grid, p, n, rng):
+    # trapezoidal CDF over [-π, π], inverse-CDF sampling
+    cdf = np.cumsum(0.5 * (p[1:] + p[:-1]) * np.diff(theta_grid))
+    cdf = np.hstack([[0.0], cdf]);
+    cdf /= cdf[-1]
+    u = rng.random(n)
+    return np.interp(u, cdf, theta_grid)
+
+
+# Build p_solver(θ) and sample actions from the solver
+Nθ = 4096
+Kmax = 16
+theta_grid = np.linspace(0, np.pi, Nθ)
+p_theta = circular_density_from_psiA(psiA_solver, theta_grid)
+rng = np.random.default_rng(0)
+n_cmp = 50000
+a_solver = sample_from_circular_density(theta_grid, p_theta, n_cmp, rng)
+
+
+# --- 3) Sample actions from the trained policy (x=0, J=0, τ=1) and wrap to [-π, π] ---
+@torch.no_grad()
+def sample_policy_actions(policy, n_samples=50000):
+    x = torch.zeros(n_samples, 1, device=device)
+    J = torch.zeros(n_samples, 1, device=device)
+    z = torch.randn(n_samples, 1, device=device)
+    tau = torch.ones(n_samples, 1, device=device)
+
+    a = policy(x, J, z, tau)  # (n,1), real-valued output
+
+    # ---- conditional projection: only if a ∈ [-2π, 0] ----
+    mask = (a >= -2 * torch.pi) & (a <= 0)
+    a = torch.where(mask, a % (2 * torch.pi), a)
+
+    return a.squeeze().cpu().numpy()
+
+
+a_policy = sample_policy_actions(policy, n_samples=n_cmp)
+
+
+# --- 4) Moment comparison on the circle: ψ̂_A(k) = E[e^{ik a}] for k=1..K_show ---
+def circular_moments(a, K_show=8):
+    moms = []
+    for k in range(1, K_show + 1):
+        moms.append(np.mean(np.exp(1j * k * a)))
+    return np.array(moms, dtype=np.complex128)
+
+
+K_show = min(16, Kmax)
+psi_policy_emp = circular_moments(a_policy, K_show=K_show)
+psi_solver_the = psiA_solver[1:K_show + 1]
+
+# Print a quick table of the first few circular moments
+print("\nFirst circular moments ψ_A(k) = E[e^{ik a}]")
+print("k |   policy (empirical)                |   solver (theory)                  |  |Δ|")
+for k in range(1, K_show + 1):
+    pval = psi_policy_emp[k - 1]
+    tval = psi_solver_the[k - 1]
+    diff = np.abs(pval - tval)
+    print(f"{k:1d} | {pval.real:+.4f}{pval.imag:+.4f}i   | {tval.real:+.4f}{tval.imag:+.4f}i   | {diff:.4e}")
+
+# --- 5) Simple CF-style distance over integer harmonics 1..K_show ---
+cf_dist = np.sqrt(np.mean(np.abs(psi_policy_emp - psi_solver_the) ** 2))
+print(f"\nCF-harmonic RMSE over k=1..{K_show}: {cf_dist:.4e}")
+
+# --- 6) Plots: histograms on the circle and moment bar-plots ---
+import seaborn as sns
+
+plt.figure(figsize=(8, 4))
+bins = 180
+sns.histplot(a_policy, bins=bins, stat='density', label='Policy actions', alpha=0.5)
+sns.histplot(a_solver, bins=bins, stat='density', label='Solver actions', alpha=0.5)
+# plt.xlim([0, np.pi])
+# plt.xlabel("action a (wrapped to [-π/2, π/2])")
+plt.xlabel("action a (wrapped to [0, π])")
+plt.ylabel("Density")
+# plt.title("Action distributions: Policy vs Numerical Solver")
+plt.legend();
+plt.grid(True);
+plt.tight_layout();
+savefig("actions_vs_solver_hist");
+plt.show()
+
+# Theoretical density from solver (line) vs policy histogram (filled)
+plt.figure(figsize=(8, 4))
+sns.histplot(a_policy, bins=bins, stat='density', label='Policy actions', alpha=0.35)
+plt.plot(theta_grid, p_theta, lw=2, label='Solver p_a(θ) (from ψ_A)', color='k')
+# plt.xlim([0, np.pi])
+plt.xlabel("action a (wrapped to [0, π])")
+plt.ylabel("Density")
+# plt.title("Policy actions vs solver circular density")
+plt.legend();
+plt.grid(True);
+plt.tight_layout();
+savefig("actions_vs_solver_density");
+plt.show()
+
+
+# Bar plot of |ψ_A(k)| and arg ψ_A(k) for both
+def angle(z): return np.angle(z)
+
+
+mod_pol = np.abs(psi_policy_emp);
+arg_pol = angle(psi_policy_emp)
+mod_sol = np.abs(psi_solver_the);
+arg_sol = angle(psi_solver_the)
+
+xk = np.arange(1, K_show + 1)
+plt.figure(figsize=(8, 3.8))
+plt.bar(xk - 0.2, mod_pol, width=0.4, label='|ψ| policy')
+plt.bar(xk + 0.2, mod_sol, width=0.4, label='|ψ| solver')
+plt.xticks(xk);
+plt.xlabel('k');
+plt.ylabel('|ψ_A(k)|')
+# plt.title('Magnitude of circular moments');
+plt.legend();
+plt.tight_layout();
+savefig("moment_magnitude");
+plt.show()
+
+plt.figure(figsize=(8, 3.8))
+plt.bar(xk - 0.2, arg_pol, width=0.4, label='arg ψ policy')
+plt.bar(xk + 0.2, arg_sol, width=0.4, label='arg ψ solver')
+plt.xticks(xk);
+plt.xlabel('k');
+plt.ylabel('arg ψ_A(k)')
+# plt.title('Phase of circular moments');
+plt.legend();
+plt.tight_layout();
+savefig("moment_phase");
+plt.show()
+from scipy.stats import wasserstein_distance
+
+W1_scipy = wasserstein_distance(a_policy, a_solver)
+print(f"SciPy Wasserstein-1 distance = {W1_scipy:.6e}")
