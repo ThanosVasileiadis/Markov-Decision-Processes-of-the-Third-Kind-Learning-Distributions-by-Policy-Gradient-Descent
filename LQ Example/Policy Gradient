@@ -1,0 +1,266 @@
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Create figures directory if it doesn't exist
+os.makedirs("figures", exist_ok=True)
+
+# ─────────── General settings ───────────
+T = 10  # horizon
+sigma = 0.1  # environment noise scale
+M = 100 * 1024  # trajectories per epoch
+W = 5.0  # frequency cutoff
+N_omega = 301  # grid size for CF
+alpha = 0.01  # kernel bandwidth
+epochs = 3000
+lr = 1e-3
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ─────────── Load “data” cumulative‐cost samples ───────────
+
+cumulative_costs = np.load("cumulative_costs.npy")
+M_data = cumulative_costs.shape[0]
+
+# ─────────── Build frequency grid ───────────
+omega_grid = torch.linspace(-W, W, N_omega, device=device, dtype=torch.float32).reshape(-1, 1)
+K = torch.exp(-alpha * omega_grid ** 2).flatten()  # (N_omega,)
+
+# ─────────── Empirical target CF from your samples ───────────
+# Compute it in NumPy then convert to torch:
+omega_np = np.linspace(-W, W, N_omega)  # (N_omega,)
+# shape (N_omega, M_data)
+exp_term = np.exp(1j * np.outer(omega_np, cumulative_costs))
+phi_target = exp_term.mean(axis=1)  # (N_omega,)
+phi_target_vals = torch.tensor(phi_target, device=device, dtype=torch.complex64)
+
+
+# ─────────── Implicit stochastic policy ───────────
+class ImplicitPolicy(nn.Module):
+    def __init__(self, hidden_dim: int = 256, n_blocks: int = 3):
+        super().__init__()
+        # input: x (1) + J (1) + z (1) = 3 features
+        self.input_layer = nn.Linear(3, hidden_dim)
+        self.input_ln = nn.LayerNorm(hidden_dim)
+        self.blocks = nn.ModuleList([
+            nn.ModuleDict({
+                'fc': nn.Linear(hidden_dim, hidden_dim),
+                'ln': nn.LayerNorm(hidden_dim),
+            }) for _ in range(n_blocks)
+        ])
+        self.output_layer = nn.Linear(hidden_dim, 1)
+
+    def forward(self, x, J, z):
+        # concatenate along feature dim
+        h = torch.cat([x, J, z], dim=-1)
+        h = F.relu(self.input_ln(self.input_layer(h)))
+        for block in self.blocks:
+            r = h
+            h = F.relu(block['ln'](block['fc'](h)))
+            h = h + r
+        return self.output_layer(h)
+
+
+policy = ImplicitPolicy().to(device)
+optimizer = optim.Adam(policy.parameters(), lr=lr)
+
+
+# ─────────── Vectorized environment step ───────────
+def step(x, a):
+    eps = torch.randn_like(x)
+    cost = 0.5 * (x.pow(2) + a.pow(2))
+    # cost = 0.5 * (x.pow(3) + a.pow(3))
+    x_next = x + a + sigma * eps
+    # x_next =x+ x * a * sigma * eps
+    return x_next, cost
+
+
+# ─────────── Training loop (CF‐matching) ───────────
+Δω = 2 * W / (N_omega - 1)  # for quadrature
+for epoch in range(epochs):
+    x = torch.zeros(M, 1, device=device)
+    J = torch.zeros(M, 1, device=device)
+    for t in range(T):
+        z = torch.randn(M, 1, device=device)
+        x_in = x
+        J_in = J
+        a = policy(x, J_in, z)
+        x, c = step(x, a)
+        J += c
+
+    # empirical CF of learned policy
+    Jt = J.t()  # (1,M)
+    exp_t = torch.exp(1j * (omega_grid @ Jt))  # (N_omega, M)
+    phi_hat = exp_t.mean(dim=1)  # (N_omega,)
+
+    # weighted L2 loss to your empirical target CF
+    rd = phi_hat.real - phi_target_vals.real
+    id = phi_hat.imag - phi_target_vals.imag
+    loss = Δω * torch.sum(K * (rd ** 2 + id ** 2))
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    if epoch % 50 == 0:
+        print('J median/99p:', J.detach().abs().median().item(),
+              J.detach().abs().quantile(0.99).item())
+
+    if epoch % 50 == 0 or epoch == epochs - 1:
+        print(f"Epoch {epoch:3d} | loss = {loss.item():.5f}")
+
+    if loss.item() < 4e-4:
+        print(f"Early stopping at epoch {epoch:3d} with loss = {loss.item():.5f}")
+        break
+
+
+# ─────────── Post‐training evaluation ───────────
+@torch.no_grad()
+def estimate_phi(policy, n_traj=4096):
+    x = torch.zeros(n_traj, 1, device=device)
+    J = torch.zeros(n_traj, 1, device=device)
+    for _ in range(T):
+        z = torch.randn(n_traj, 1, device=device)
+        J_in = J  # / (1e-6 + J.detach().abs().median())
+        a = policy(x, J_in, z)
+        x, c = step(x, a)
+        J += c
+    exp_t = torch.exp(1j * (omega_grid @ J.t()))
+    return exp_t.mean(dim=1).cpu().numpy()
+
+
+phi_learned = estimate_phi(policy)
+
+# ─── Plot CFs: real & imag separately ───
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+ax1.plot(omega_np, phi_target.real, '--', label="Target Re φ")
+ax1.plot(omega_np, phi_learned.real, label="Learned Re φ")
+ax1.set_ylabel("Re φ(ω)");
+ax1.legend();
+ax1.grid(True)
+ax2.plot(omega_np, phi_target.imag, '--', label="Target Im φ")
+ax2.plot(omega_np, phi_learned.imag, label="Learned Im φ")
+ax2.set_xlabel("ω");
+ax2.set_ylabel("Im φ(ω)");
+ax2.legend();
+ax2.grid(True)
+plt.tight_layout()
+plt.savefig("figures/cf_plot.png", dpi=300)
+plt.show()
+plt.close()
+
+# ─── Compare cost distributions ───
+# 1) plot original histogram
+plt.figure(figsize=(8, 4))
+sns.histplot(cumulative_costs, bins=100, stat='density', label='Target', alpha=0.6)
+
+# 2) sample from learned policy
+M_eval = 10000
+x = torch.zeros(M_eval, 1, device=device)
+J = torch.zeros(M_eval, 1, device=device)
+for _ in range(T):
+    z = torch.randn(M_eval, 1, device=device)
+    a = policy(x, J, z)  # ← pass J
+    x, c = step(x, a)
+    J += c
+learned_costs = J.detach().cpu().numpy().squeeze()
+
+sns.histplot(learned_costs, bins=100, stat='density', label='Learned', alpha=0.6)
+plt.title("Cost Distributions: Target vs. Learned")
+plt.xlabel("Cumulative Cost");
+plt.ylabel("Density")
+plt.legend();
+plt.grid(True);
+plt.tight_layout()
+plt.savefig("figures/cost_distribution.png", dpi=300)
+
+plt.show()
+plt.close()
+
+policy.to(device).eval()
+
+
+def plot_action_distributions(policy, x_values, n_samples=20000, bins=100, J0=0.0):
+    """
+    Draws overlaid histograms of actions sampled from `policy` at each state in `x_values`.
+    """
+    plt.figure(figsize=(8, 5))
+    for x0 in x_values:
+        # make a batch of size n_samples with state = x0
+        x = torch.full((n_samples, 1), float(x0), device=device)
+        J = torch.full((n_samples, 1), float(J0), device=device)  # ← new
+        z = torch.randn(n_samples, 1, device=device)  # policy noise
+        with torch.no_grad():
+            a = policy(x, J, z)
+        actions = a.cpu().numpy().flatten()
+        sns.histplot(actions,
+                     bins=bins,
+                     stat="density",
+                     kde=False,
+                     label=f"s = {x0}",
+                     element="step",
+                     fill=False)
+
+    plt.title("Action Distributions for Different States")
+    plt.xlabel("Action value")
+    plt.ylabel("Density")
+    plt.legend(title="State")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.tight_layout()
+    plt.savefig("figures/action_distributions.png", dpi=300)
+    plt.show()
+    plt.close()
+
+
+plot_action_distributions(policy,
+                          x_values=[-1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0],
+                          n_samples=20000,
+                          bins=100)
+
+from scipy.stats import wasserstein_distance, ks_2samp, cramervonmises_2samp
+
+# ─── Statistical comparisons ───
+print("Statistical Comparison between Target and Learned Cost Distributions")
+
+# 1. Wasserstein distance (1D)
+w1 = wasserstein_distance(cumulative_costs, learned_costs)
+print(f" Wasserstein  distance: {w1:.4f}")
+
+# 2. Kolmogorov–Smirnov test
+ks_stat, ks_pval = ks_2samp(cumulative_costs, learned_costs)
+print(f" KS test: statistic = {ks_stat:.4f}, p-value = {ks_pval:.4f}")
+
+# 3. Cramér–von Mises test
+cvm_result = cramervonmises_2samp(cumulative_costs, learned_costs)
+print(f" Cramér–von Mises test: statistic = {cvm_result.statistic:.4f}, p-value = {cvm_result.pvalue:.4f}")
+
+if ks_pval < 0.05:
+    print(" The KS test rejects the null: distributions are likely different.")
+else:
+    print(" The KS test does not reject the null: distributions may be the same.")
+
+if cvm_result.pvalue < 0.05:
+    print(" The CvM test rejects the null: distributions are likely different.")
+else:
+    print(" The CvM test does not reject the null: distributions may be the same.")
+# ─── Save numerical results to text file ───
+results_path = "figures/results.txt"
+with open(results_path, "w") as f:
+    f.write("=== Distribution Matching Results ===\n\n")
+    f.write(f"Final CF loss: {loss.item():.6f}\n")
+    f.write(f"Wasserstein distance W1: {w1:.6f}\n\n")
+
+    f.write("Kolmogorov–Smirnov test:\n")
+    f.write(f"  statistic = {ks_stat:.6f}\n")
+    f.write(f"  p-value   = {ks_pval:.6f}\n\n")
+
+    f.write("Cramér–von Mises test:\n")
+    f.write(f"  statistic = {cvm_result.statistic:.6f}\n")
+    f.write(f"  p-value   = {cvm_result.pvalue:.6f}\n\n")
+
+print(f"Saved results and plots inside: figures/")
