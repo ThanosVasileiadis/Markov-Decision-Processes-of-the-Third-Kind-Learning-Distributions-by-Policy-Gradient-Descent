@@ -1,0 +1,326 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+# import scipy.stats as st
+from scipy import stats
+
+import os
+
+os.makedirs("figures", exist_ok=True)
+
+# ─────────── General settings ───────────
+T = 20  # number of trading/rebalancing steps (matches earlier sim)
+W = 9  # frequency cutoff
+N_omega = 301  # grid size for CF
+alpha = 0.025  # kernel bandwidth
+epochs = 201
+lr = 1e-4
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Black–Scholes model parameters
+s0 = 100.0  # initial wealth
+r_bs = 0.02  # risk-free rate (annualized)
+mu_bs = 0.06  # stock drift (annualized)
+sigma_bs = 0.40  # stock volatility (annualized)
+T_years = 1.0  # horizon in years
+dt = T_years / T
+growth = np.exp(r_bs * dt)  # e^{r Δt}
+diff_term = sigma_bs * np.sqrt(dt)  # σ √Δt
+drift_adj = (mu_bs - 0.5 * sigma_bs ** 2 - r_bs) * dt  # (μ - ½σ² - r)Δt
+
+# Batch sizes
+M = 100 * 1024  # trajectories per epoch
+
+# ─────────── Load target terminal-wealth samples ───────────
+cumulative_costs = np.load("simulated_terminal_wealth.npy")  # shape (M_data,)
+target_samples = cumulative_costs.copy()
+M_data = cumulative_costs.shape[0]
+
+# ─────────── Build frequency grid ───────────
+omega_grid = torch.linspace(-W, W, N_omega, device=device, dtype=torch.float32).reshape(-1, 1)
+K = torch.exp(-alpha * omega_grid ** 2).flatten()  # (N_omega,)
+
+# K = torch.exp(-alpha * omega_grid**2) / (1 + (omega_grid**2))
+
+# ─────────── Empirical target CF from your samples ───────────
+omega_np = np.linspace(-W, W, N_omega)  # (N_omega,)
+exp_term = np.exp(1j * np.outer(omega_np, cumulative_costs))  # (N_omega, M_data)
+phi_target = exp_term.mean(axis=1)  # (N_omega,)
+phi_target_vals = torch.tensor(phi_target, device=device, dtype=torch.complex64)
+
+
+# ---------- Fixed target distribution CF  ----------
+# ─────────── Target: Normal(μ_T, σ_T²) terminal distribution ───────────
+# mu_T     = 102.0197
+# sigma_T  = 0.1165
+
+# omega_np   = np.linspace(-W, W, N_omega)
+# phi_target = np.exp(1j * omega_np * mu_T - 0.5 * (sigma_T**2) * omega_np**2)
+# phi_target_vals = torch.tensor(phi_target, device=device, dtype=torch.complex64)
+
+# ─────────── Implicit stochastic policy ───────────
+class ImplicitPolicy(nn.Module):
+    def __init__(self, hidden_dim: int = 256, n_blocks: int = 3):
+        super().__init__()
+        # input: s (1)  + z (1) + tau (1) = 4 features
+        self.input_layer = nn.Linear(3, hidden_dim)
+        self.input_ln = nn.LayerNorm(hidden_dim)
+        self.blocks = nn.ModuleList([
+            nn.ModuleDict({
+                'fc': nn.Linear(hidden_dim, hidden_dim),
+                'ln': nn.LayerNorm(hidden_dim),
+            }) for _ in range(n_blocks)
+        ])
+        self.output_layer = nn.Linear(hidden_dim, 1)
+
+    def forward(self, s, z, tau):
+        h = torch.cat([s, z, tau], dim=-1)
+        h = F.relu(self.input_ln(self.input_layer(h)))
+        for block in self.blocks:
+            r = h
+            h = F.relu(block['ln'](block['fc'](h)))
+            h = h + r
+        logits = self.output_layer(h)  # unconstrained
+        # pi_max = 1.0  # allow up to 100% long/short; tweak as desired
+        # pi = pi_max * torch.tanh(logits)  # fraction in [-pi_max, pi_max]
+        # pi = torch.clamp(logits, -1, 1)
+        # pi = 0.5 * (torch.tanh(logits) + 1.0)
+        pi = torch.sigmoid(logits)  # (0,1)
+        return pi
+        # return self.output_layer(h)
+
+
+policy = ImplicitPolicy().to(device)
+optimizer = optim.Adam(policy.parameters(), lr=lr)
+
+
+# ─────────── Vectorized environment step: terminal-wealth dynamics ───────────
+# s_{n+1} = e^{r Δt} ( s_n + a_n * y_{n+1} )
+# y_{n+1} = exp((μ - ½σ² - r)Δt + σ√Δt ε) - 1,  ε ~ N(0,1)
+def step_wealth(s, a):
+    eps = torch.randn_like(s)
+
+    # Risk-free multiplier
+    Rf = torch.exp(torch.tensor(r_bs * dt, device=s.device))
+
+    # Stock gross return G_{n+1}
+    G = torch.exp(
+        (mu_bs - 0.5 * sigma_bs ** 2) * dt
+        + sigma_bs * torch.sqrt(torch.tensor(dt, device=s.device)) * eps
+    )
+
+    # Excess return over the risk-free asset
+    Y = G / Rf - 1.0
+
+    # Wealth evolution
+    s_next = Rf * s * (1.0 + a * Y)
+
+    return s_next
+
+
+# ─────────── Training loop (CF‐matching on terminal wealth) ───────────
+Δω = 2 * W / (N_omega - 1)  # for quadrature
+for epoch in range(epochs):
+    # s holds wealth; J will mirror "current" wealth so that at the end J = s_T
+    s = torch.full((M, 1), s0, device=device)
+    J = s.clone()
+
+    for t in range(T):
+        z = torch.randn(M, 1, device=device)
+        s_in = s
+        J_in = J
+        tau = torch.full((M, 1), float((T - t) / T), device=device)
+        a = policy(s_in, z, tau)  # action (free-form; network learns)
+        s_next = step_wealth(s, a)
+        J = s_next
+        # keep J in sync with wealth so that after the loop J=s_T
+        # c = s_next - J
+        s = s_next
+        # J = J + c
+
+    # empirical CF of terminal wealth (stored in J)
+    Jt = J.t()  # (1,M)
+    exp_t = torch.exp(1j * (omega_grid @ Jt))  # (N_omega, M)
+    phi_hat = exp_t.mean(dim=1)  # (N_omega,)
+
+    # weighted L2 loss to your empirical target CF
+    rd = phi_hat.real - phi_target_vals.real
+    id = phi_hat.imag - phi_target_vals.imag
+    loss = Δω * torch.sum(K * (rd ** 2 + id ** 2))
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    if epoch % 50 == 0:
+        print('Wealth | median/99p:', J.detach().abs().median().item(),
+              J.detach().abs().quantile(0.99).item())
+
+    if epoch % 50 == 0 or epoch == epochs - 1:
+        print(f"Epoch {epoch:3d} | loss = {loss.item():.5f}")
+
+    if loss.item() < 1e-3:
+        print(f"Early stopping at epoch {epoch:3d} with loss = {loss.item():.5f}")
+        break
+
+
+# ─────────── Post‐training evaluation ───────────
+@torch.no_grad()
+def estimate_phi(policy, n_traj=4096):
+    s = torch.full((n_traj, 1), s0, device=device)
+    J = s.clone()
+    for t in range(T):
+        z = torch.randn(n_traj, 1, device=device)
+        tau = torch.full((n_traj, 1), float((T - t) / T), device=device)
+        a = policy(s, z, tau)
+        s_next = step_wealth(s, a)
+        # c = s_next - J
+        # s = s_next
+        # J = J + c
+        J = s_next
+    exp_t = torch.exp(1j * (omega_grid @ J.t()))
+    return exp_t.mean(dim=1).cpu().numpy()
+
+
+phi_learned = estimate_phi(policy)
+
+# ─── Plot CFs: real & imag separately ───
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+ax1.plot(omega_np, phi_target.real, '--', label="Target Re φ")
+ax1.plot(omega_np, phi_learned.real, label="Learned Re φ")
+ax1.set_ylabel("Re φ(ω)");
+ax1.legend();
+ax1.grid(True)
+ax2.plot(omega_np, phi_target.imag, '--', label="Target Im φ")
+ax2.plot(omega_np, phi_learned.imag, label="Learned Im φ")
+ax2.set_xlabel("ω");
+ax2.set_ylabel("Im φ(ω)");
+ax2.legend();
+ax2.grid(True)
+plt.tight_layout()
+
+fig.savefig("figures/cf_comparison.png", dpi=300)
+print("Saved CF comparison to figures/cf_comparison.png")
+
+plt.show()
+plt.close(fig)
+
+# --- Evaluate learned policy ---
+
+M_eval = 10000
+s = torch.full((M_eval, 1), s0, device=device)
+J = s.clone()
+
+for t in range(T):
+    z = torch.randn(M_eval, 1, device=device)
+    tau = torch.full((M_eval, 1), float((T - t) / T), device=device)
+    a = policy(s, z, tau)
+    s_next = step_wealth(s, a)
+    J = s_next
+    s = s_next
+
+learned_costs = J.detach().cpu().numpy().squeeze()
+print("learned_costs computed:", learned_costs.shape)
+
+plt.figure(figsize=(10, 5))
+
+# target (empirical)
+sns.histplot(target_samples, bins=100, stat='density',
+             color='blue', alpha=0.4, label='Empirical Target')
+sns.kdeplot(target_samples, color='blue')
+
+# learned (empirical)
+sns.histplot(learned_costs, bins=100, stat='density',
+             color='red', alpha=0.4, label='Learned $S_N$')
+sns.kdeplot(learned_costs, color='red')
+
+plt.xlabel("Terminal Wealth $S_N$")
+plt.ylabel("Density")
+plt.title("Empirical Distribution Comparison: Target vs Learned")
+plt.legend()
+plt.tight_layout()
+
+plt.savefig("figures/terminal_wealth_distribution.png", dpi=300)
+print("Saved: figures/terminal_wealth_distribution.png")
+
+plt.show()
+
+plt.figure(figsize=(10, 5))
+
+x1 = np.sort(target_samples)
+x2 = np.sort(learned_costs)
+
+y1 = np.arange(1, len(x1) + 1) / len(x1)
+y2 = np.arange(1, len(x2) + 1) / len(x2)
+
+plt.plot(x1, y1, label="Target ECDF", color='blue')
+plt.plot(x2, y2, label="Learned ECDF", color='red')
+
+plt.xlabel("Terminal Wealth $S_N$")
+plt.ylabel("Empirical CDF")
+plt.title("Empirical CDF Comparison")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+
+plt.savefig("figures/terminal_wealth_ecdf_comparison.png", dpi=300)
+print("Saved: figures/terminal_wealth_ecdf_comparison.png")
+
+plt.show()
+
+print("\n📊 Two-Sample Empirical Comparison")
+
+# Wasserstein (earth mover's distance)
+w1 = stats.wasserstein_distance(target_samples, learned_costs)
+print(f"• Wasserstein distance: {w1:.6f}")
+
+# Kolmogorov–Smirnov
+ks_stat, ks_pvalue = stats.ks_2samp(target_samples, learned_costs)
+print(f"• KS test: statistic={ks_stat:.6f}, p-value={ks_pvalue:.6f}")
+
+# Cramér–von Mises
+cvm = stats.cramervonmises_2samp(target_samples, learned_costs)
+print(f"• CvM test: statistic={cvm.statistic:.6f}, p-value={cvm.pvalue:.6f}")
+
+
+def plot_action_distributions(policy, x_values, n_samples=10000, bins=50, J0=s0):
+    """
+    Draws overlaid histograms of actions sampled from `policy` at each wealth state in `x_values`.
+    """
+    plt.figure(figsize=(8, 5))
+    for x0 in x_values:
+        s = torch.full((n_samples, 1), float(x0), device=device)
+        J = torch.full((n_samples, 1), float(J0), device=device)
+        z = torch.randn(n_samples, 1, device=device)
+        tau = torch.ones(n_samples, 1, device=device)  # start-of-episode
+        with torch.no_grad():
+            a = policy(s, z, tau)
+        actions = a.cpu().numpy().flatten()
+        print(f"State s = {x0}: action mean = {actions.mean():.4f}, std = {actions.std(ddof=1):.4f}")
+        sns.histplot(actions, bins=bins, stat="density", label=f"s = {x0}",
+                     element="step", fill=False)
+
+    plt.title("Action Distributions for Different Wealth States")
+    plt.xlabel("Action value");
+    plt.ylabel("Density")
+    plt.legend(title="State");
+    plt.grid(True);
+    plt.tight_layout()
+
+    plt.savefig("figures/action_distributions.png", dpi=300)
+    print("Saved action distributions to figures/action_distributions.png")
+
+    plt.show();
+    plt.close()
+
+
+# Example: plot for wealth levels
+plot_action_distributions(policy,
+                          x_values=[95, 97.5, 100, 102.5, 105],
+                          n_samples=20000,
+                          bins=100)
+
