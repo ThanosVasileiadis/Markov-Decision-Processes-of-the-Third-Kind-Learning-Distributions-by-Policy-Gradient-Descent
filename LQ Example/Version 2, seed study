@@ -1,0 +1,528 @@
+#!/usr/bin/env python3
+"""Ten-seed LQ study using the existing lq_cuda training and audit implementation.
+
+prepare: freeze target, settings, noise seeds, and source code.
+train: one independent seed, larger audit, saved common-noise action samples.
+run: sequential seeds in a compute allocation.
+compare: all pairwise W1 comparisons from saved actions.
+
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import importlib.util
+import json
+import math
+import os
+import shutil
+import sys
+import time
+from contextlib import contextmanager
+from dataclasses import asdict
+from itertools import combinations
+from pathlib import Path
+
+import numpy as np
+
+
+def digest(path):
+    result = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            result.update(block)
+    return result.hexdigest()
+
+
+def write_json(path, value):
+    path = Path(path)
+    temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
+    temporary.replace(path)
+
+
+def load_core(path):
+    name = "_lq_study_core_" + digest(path)[:12]
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[name]
+
+
+def manifest(root):
+    root = Path(root).expanduser().resolve()
+    if digest(root / "experiment.json") != (root / "experiment.sha256").read_text().strip():
+        raise ValueError("Experiment settings changed after preparation. Prepare a new study directory.")
+    data = json.loads((root / "experiment.json").read_text())
+    if data.get("schema") != 1:
+        raise ValueError("Unsupported experiment schema")
+    checks = ((root / "target.npy", "target_sha256"),
+              (root / "lq_core.py", "core_sha256"),
+              (Path(__file__), "runner_sha256"))
+    for path, key in checks:
+        if digest(path) != data[key]:
+            raise ValueError(f"Study file changed: {path}. Use the frozen study_runner.py for this experiment.")
+    return root, data
+
+
+@contextmanager
+def exclusive_lock(path):
+    path = Path(path)
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        os.write(fd, json.dumps({"pid": os.getpid(), "host": os.uname().nodename,
+                                 "slurm_job": os.environ.get("SLURM_JOB_ID")}).encode())
+        os.close(fd)
+        yield
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def parse_seeds(text):
+    values = [int(item.strip()) for item in text.split(",")]
+    if len(values) < 2 or min(values) < 0 or len(set(values)) != len(values):
+        raise ValueError("Supply at least two unique nonnegative seed integers")
+    return values
+
+
+def prepare(args):
+    core = load_core(Path(__file__).with_name("lq_cuda.py"))
+    cfg = core.Config()
+    # Match the successful reference training run; a separately increased audit
+    # evaluates the chosen checkpoint after training.
+    cfg.epochs, cfg.train_batch = args.epochs, args.train_batch
+    cfg.validation_batch, cfg.test_batch = args.validation_batch, 16384
+    cfg.action_states, cfg.action_rewards = args.states, args.rewards
+    cfg.action_steps, cfg.action_samples = args.steps, args.monitor_samples
+    cfg.action_every, cfg.action_lag = 1, 10
+    cfg.action_seed = 7142027
+    if args.smoke:
+        cfg.epochs, cfg.horizon, cfg.width, cfg.blocks = 3, 2, 16, 1
+        cfg.frequencies, cfg.target_n = 11, 256
+        cfg.train_batch = cfg.validation_batch = cfg.test_batch = cfg.audit_batch = 32
+        cfg.validation_replicates = cfg.test_replicates = cfg.audit_replicates = 2
+        cfg.perturbation_batch, cfg.perturbation_replicates, cfg.perturbation_directions = 32, 2, 0
+        cfg.eval_every, cfg.action_samples, cfg.action_lag = 1, 32, 2
+        cfg.action_states, cfg.action_rewards = "-0.1,0,0.1", "-0.05,0"
+    core.validate_config(cfg)
+    if cfg.action_samples == 0:
+        raise ValueError("This study requires action monitoring; monitor_samples must be positive")
+    seeds = parse_seeds(args.seeds if args.seeds else ("2026,2027" if args.smoke
+                                                    else ",".join(map(str, range(2026, 2036)))))
+    if args.target_checkpoint:
+        source = core.load_checkpoint(args.target_checkpoint)
+        for key in ("horizon", "sigma"):
+            if source["config"][key] != getattr(cfg, key):
+                raise ValueError(f"Target checkpoint's {key} differs from study settings")
+        target = source["target_samples"].detach().cpu().numpy().astype(np.float64)
+        target_source = str(Path(args.target_checkpoint).resolve())
+    elif args.target_file:
+        target = np.asarray(np.load(args.target_file, allow_pickle=False), dtype=np.float64).reshape(-1)
+        target_source = str(Path(args.target_file).resolve())
+    else:
+        target = core.generate_article_target(cfg.target_n, cfg.horizon, cfg.sigma, args.target_seed)
+        target_source = f"Generated once with independent target seed {args.target_seed}"
+    if target.ndim != 1 or len(target) < 2 or not np.isfinite(target).all() or np.any(target > 0):
+        raise ValueError("Target must be finite 1D negative cumulative reward samples")
+    cfg.target_n = len(target)
+    audit = {"test_batch": 32768, "test_replicates": 12,
+             "audit_batch": 8192, "audit_replicates": 48,
+             "perturbation_batch": 8192, "perturbation_replicates": 12,
+             "perturbation_directions": 4,
+             "perturbation_scales": "0.000001,0.00001,0.0001,0.001",
+             "gradient_tolerance": 0.05,
+             "action_samples": 4096, "action_audit_replicates": 8}
+    if args.smoke:
+        audit.update(test_batch=32, test_replicates=2, audit_batch=32, audit_replicates=2,
+                     perturbation_batch=32, perturbation_replicates=2, perturbation_directions=0,
+                     action_samples=32, action_audit_replicates=2)
+    comparison_samples = 32 if args.smoke else args.compare_samples
+    comparison_replicates = 2 if args.smoke else args.compare_replicates
+    if comparison_samples < 4 or comparison_replicates < 2:
+        raise ValueError("Comparison requires >=4 samples and >=2 fresh banks")
+    root = Path(args.experiment).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=False)
+    (root / "seeds").mkdir()
+    np.save(root / "target.npy", target, allow_pickle=False)
+    shutil.copyfile(Path(__file__).with_name("lq_cuda.py"), root / "lq_core.py")
+    shutil.copyfile(__file__, root / "study_runner.py")
+    comparison = {"spec": core.action_probe_spec(cfg), "samples": comparison_samples,
+                  "replicates": comparison_replicates,
+                  "noise_seeds": [314159 + k for k in range(comparison_replicates)],
+                  "control_noise_seeds": [1314159 + k for k in range(comparison_replicates)],
+                  "chunk": 2048}
+    data = {"schema": 1, "profile": "smoke" if args.smoke else "full",
+            "seeds": seeds, "training": asdict(cfg), "increased_audit": audit,
+            "checkpoint_choice": args.checkpoint_choice, "target_source": target_source,
+            "target_sha256": digest(root / "target.npy"),
+            "core_sha256": digest(root / "lq_core.py"), "runner_sha256": digest(__file__),
+            "comparison": comparison,
+            "limits": ["Same empirical target and objective for every training seed.",
+                       "Grid includes off-trajectory state/reward combinations.",
+                       "Small gradients and distinct action samples do not prove exact stationary points."]}
+    write_json(root / "experiment.json", data)
+    (root / "experiment.sha256").write_text(digest(root / "experiment.json") + "\n")
+    print(f"Prepared {len(seeds)} seeds in {root}; checkpoint rule={args.checkpoint_choice}", flush=True)
+
+
+def seed_dir(root, seed):
+    return root / "seeds" / f"seed_{seed}"
+
+
+def completion(root, data, seed):
+    directory = seed_dir(root, seed)
+    path = directory / "done.json"
+    if not path.exists():
+        return None
+    value = json.loads(path.read_text())
+    if value["seed"] != seed or value["target_sha256"] != data["target_sha256"]:
+        raise ValueError(f"Seed completion metadata does not match study: {seed}")
+    for filename, expected in value["file_sha256"].items():
+        if digest(directory / filename) != expected:
+            raise ValueError(f"Completed seed file changed: {directory / filename}")
+    return value
+
+
+def sample_checkpoint(core, checkpoint, cfg, settings, destination):
+    import torch
+    device = core.configure_runtime(cfg)
+    model = core.Policy(cfg.width, cfg.blocks).to(device)
+    model.load_state_dict(checkpoint["state_dict"])
+    shape = (2, settings["replicates"], len(settings["spec"]["points"]), settings["samples"])
+    actions = np.lib.format.open_memmap(destination, mode="w+", dtype=np.float32, shape=shape)
+    all_noise = np.empty((2, settings["replicates"], settings["samples"]), dtype=np.float32)
+    for bank, seed_list in enumerate((settings["noise_seeds"], settings["control_noise_seeds"])):
+        for replicate, noise_seed in enumerate(seed_list):
+            all_noise[bank, replicate] = torch.randn(
+                settings["samples"], generator=torch.Generator(device="cpu").manual_seed(noise_seed)).numpy()
+            actions[bank, replicate] = core.action_probe_samples(
+                model, settings["spec"], settings["samples"], noise_seed,
+                settings["chunk"], sort_actions=False)
+    actions.flush()
+    del actions, model
+    return all_noise
+
+
+def train_seed(args):
+    root, data = manifest(args.experiment)
+    if args.index < 0 or args.index >= len(data["seeds"]):
+        raise ValueError("Seed index outside experiment range")
+    seed = data["seeds"][args.index]
+    existing = completion(root, data, seed)
+    if existing:
+        print(f"Seed {seed} already complete; verified files, skipping.", flush=True)
+    else:
+        with exclusive_lock(root / f"seed_{seed}.lock"):
+            directory = seed_dir(root, seed)
+            if directory.exists():
+                if not args.retry:
+                    raise FileExistsError(f"Incomplete seed output exists: {directory}. "
+                                          "Use --retry to archive it and restart this seed.")
+                backup = directory.with_name(directory.name + f".incomplete_{time.time_ns()}")
+                directory.rename(backup)
+            directory.mkdir()
+            core = load_core(root / "lq_core.py")
+            cfg = core.Config(**data["training"])
+            cfg.seed, cfg.target_file = seed, str(root / "target.npy")
+            cfg.output = str(directory / "training")
+            cfg.device, cfg.cpu_threads = args.device, args.cpu_threads
+            started = time.perf_counter()
+            print(f"Seed index={args.index}, training seed={seed}, target={data['target_sha256']}", flush=True)
+            try:
+                core.run(cfg)
+                checkpoint_path = directory / "training" / f"{data['checkpoint_choice']}_policy.pt"
+                request = core.Config(**asdict(cfg))
+                request.audit_checkpoint, request.output = str(checkpoint_path), str(directory / "audit")
+                for key, value in data["increased_audit"].items():
+                    setattr(request, key, value)
+                core.run(request)
+                checkpoint = core.load_checkpoint(checkpoint_path)
+                noise = sample_checkpoint(core, checkpoint, cfg, data["comparison"], directory / "actions.npy")
+                np.save(directory / "noise_banks.npy", noise, allow_pickle=False)
+                files = ["actions.npy", "noise_banks.npy", "audit/audit.json",
+                         "training/action_stability_history.json",
+                         f"training/{data['checkpoint_choice']}_policy.pt"]
+                done = {"seed": seed, "index": args.index, "checkpoint_epoch": checkpoint["epoch"],
+                        "checkpoint_choice": data["checkpoint_choice"],
+                        "target_sha256": data["target_sha256"], "core_sha256": data["core_sha256"],
+                        "device": args.device, "elapsed_seconds": time.perf_counter() - started,
+                        "file_sha256": {filename: digest(directory / filename) for filename in files}}
+                write_json(directory / "done.json", done)
+                print(f"Seed {seed} complete in {done['elapsed_seconds']:.1f}s", flush=True)
+            except BaseException as exc:
+                write_json(directory / "failed.json", {"seed": seed, "error": str(exc)})
+                raise
+    if args.compare_if_ready:
+        if all((seed_dir(root, s) / "done.json").exists() for s in data["seeds"]):
+            try:
+                compare(args)
+            except FileExistsError as exc:
+                if exc.filename == str(root / "comparison.lock"):
+                    print("Another worker is building comparisons.", flush=True)
+                else:
+                    raise
+
+
+def w1_sorted(a, b):
+    if a.shape != b.shape or a.ndim != 2:
+        raise ValueError("Matching grid/sample shapes are required")
+    return np.abs(a.astype(np.float64) - b.astype(np.float64)).mean(axis=1)
+
+
+def stats(values, spec):
+    index = int(np.argmax(values))
+    s, r, t = spec["points"][index]
+    return {"mean": float(np.mean(values)), "p95": float(np.quantile(values, .95)),
+            "max": float(values[index]), "worst_state": s, "worst_reward": r, "worst_step": t}
+
+
+def se(values):
+    return float(np.std(values, ddof=1) / math.sqrt(len(values))) if len(values) > 1 else None
+
+
+def pairwise_statistics(common, control, spec):
+    """Raw arrays: (models, banks, grid cells, samples). No policy inference."""
+    if common.shape != control.shape or common.ndim != 4 or common.shape[2] != len(spec["points"]):
+        raise ValueError("Saved action arrays do not match the fixed comparison grid")
+    models, banks, cells, n = common.shape
+    pairs = list(combinations(range(models), 2))
+    distances = np.empty((len(pairs), banks, cells), dtype=np.float64)
+    half_distances = np.empty_like(distances)
+    baselines = np.empty((models, banks, cells), dtype=np.float64)
+    # Each bank is sorted only once per model, then reused for all pairs.
+    for bank in range(banks):
+        ordered = np.sort(common[:, bank], axis=-1)
+        half = np.sort(common[:, bank, :, :n // 2], axis=-1)
+        independent = np.sort(control[:, bank], axis=-1)
+        for index, (i, j) in enumerate(pairs):
+            distances[index, bank] = w1_sorted(ordered[i], ordered[j])
+            half_distances[index, bank] = w1_sorted(half[i], half[j])
+        for i in range(models):
+            baselines[i, bank] = w1_sorted(ordered[i], independent[i])
+    summaries = []
+    matrix = np.zeros((models, models), dtype=np.float64)
+    max_matrix = np.zeros_like(matrix)
+    for index, (i, j) in enumerate(pairs):
+        cell_means = distances[index].mean(axis=0)
+        item = {"index_i": i, "index_j": j, **stats(cell_means, spec),
+                "mean_standard_error": se(distances[index].mean(axis=1)),
+                "half_sample_mean": float(half_distances[index].mean()),
+                "replicate_means": distances[index].mean(axis=1).tolist()}
+        summaries.append(item)
+        matrix[i, j] = matrix[j, i] = item["mean"]
+        max_matrix[i, j] = max_matrix[j, i] = item["max"]
+    baseline_summaries = [{"index": i, **stats(baselines[i].mean(axis=0), spec),
+                           "mean_standard_error": se(baselines[i].mean(axis=1))} for i in range(models)]
+    return summaries, baseline_summaries, matrix, max_matrix, distances, half_distances, baselines
+
+
+def seed_summary(root, data, seed, done):
+    directory = seed_dir(root, seed)
+    audit = json.loads((directory / "audit" / "audit.json").read_text())
+    history = json.loads((directory / "training" / "action_stability_history.json").read_text())["measurements"]
+    tail = history[-min(100, len(history)):]
+    lag = [r["lag"]["mean"] for r in tail if r["lag"] is not None]
+    gradient = audit["gradient_audit"]
+    selected = audit.get("action_stability", {}).get("comparisons", [])
+    selected_previous = next((row["mean"] for row in selected if row["reference"] == "previous_monitored_epoch"), None)
+    return {"seed": seed, "checkpoint_epoch": done["checkpoint_epoch"],
+            "reward_cf_loss": audit["fresh_test_loss_mean"],
+            "reward_crossfit_loss": audit["independent_half_loss_audit"]["unbiased_loss_estimate"],
+            "reward_w1": audit["distribution_diagnostics"]["w1_equal_size_sample"],
+            "reward_ks": audit["distribution_diagnostics"]["ks_equal_size_sample"],
+            "gradient_norm": gradient["mean_gradient_norm"],
+            "gradient_se_norm": gradient["gradient_standard_error_norm"],
+            "gradient_screen": gradient["plug_in_gradient_norm_screen"],
+            "small_gradient_supported": gradient["small_gradient_supported"],
+            "descent_detected": audit["perturbation_audit"]["descent_detected"],
+            "selected_checkpoint_previous_w1": selected_previous,
+            "last_window_epochs": len(tail),
+            "last_window_previous_mean_w1": float(np.mean([r["previous"]["mean"] for r in tail])),
+            "last_window_lag_mean_w1": float(np.mean(lag)) if lag else None,
+            "worker_elapsed_seconds": done["elapsed_seconds"]}
+
+
+def write_csv(path, rows):
+    if not rows:
+        return
+    with Path(path).open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def plot_heatmaps(output, data, matrix, max_matrix, distances):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    labels = list(map(str, data["seeds"]))
+    def draw(values, title, destination, vmax=None):
+        fig, ax = plt.subplots(figsize=(9, 7), constrained_layout=True)
+        im = ax.imshow(values, cmap="viridis", vmin=0, vmax=vmax)
+        ax.set_xticks(range(len(labels)), labels, rotation=45, ha="right")
+        ax.set_yticks(range(len(labels)), labels)
+        ax.set_xlabel("Training seed")
+        ax.set_ylabel("Training seed")
+        ax.set_title(title)
+        fig.colorbar(im, ax=ax, label="Action Wasserstein-1 distance")
+        fig.savefig(destination, dpi=180)
+        plt.close(fig)
+    draw(matrix, "Mean action W1 across fixed grid", output / "pairwise_mean_w1.png")
+    draw(max_matrix, "Maximum grid-cell mean action W1", output / "pairwise_max_w1.png")
+    points = data["comparison"]["spec"]["points"]
+    step_matrices = []
+    for step in data["comparison"]["spec"]["steps"]:
+        mask = np.array([p[2] == step for p in points])
+        values = np.zeros_like(matrix)
+        for index, (i, j) in enumerate(combinations(range(len(labels)), 2)):
+            values[i, j] = values[j, i] = distances[index, :, mask].mean()
+        step_matrices.append((step, values))
+    limit = max(float(values.max()) for _, values in step_matrices)
+    for step, values in step_matrices:
+        draw(values, f"Mean action W1 at decision t={step}",
+             output / f"pairwise_w1_step_{step}.png", vmax=limit if limit > 0 else 1e-12)
+
+
+def compare(args):
+    root, data = manifest(args.experiment)
+    with exclusive_lock(root / "comparison.lock"):
+        completed = [completion(root, data, seed) for seed in data["seeds"]]
+        missing = [seed for seed, status in zip(data["seeds"], completed) if status is None]
+        if missing:
+            raise RuntimeError(f"Incomplete seeds: {missing}. No partial comparison will be reported.")
+        output = root / "comparison"
+        if (output / "complete.json").exists():
+            completed_comparison = json.loads((output / "complete.json").read_text())
+            for filename, expected_hash in completed_comparison["file_sha256"].items():
+                if digest(output / filename) != expected_hash:
+                    raise ValueError(f"Completed comparison output changed: {output / filename}")
+            print(f"Comparison already complete: {output}", flush=True)
+            return
+        output.mkdir(exist_ok=True)
+        settings = data["comparison"]
+        expected = (2, settings["replicates"], len(settings["spec"]["points"]), settings["samples"])
+        actions, same_noise = [], None
+        for seed in data["seeds"]:
+            directory = seed_dir(root, seed)
+            noise = np.load(directory / "noise_banks.npy", allow_pickle=False)
+            if same_noise is not None and not np.array_equal(noise, same_noise):
+                raise ValueError("Policies were not evaluated with identical Gaussian noise arrays")
+            same_noise = noise
+            array = np.load(directory / "actions.npy", mmap_mode="r", allow_pickle=False)
+            if array.shape != expected or not np.isfinite(array).all():
+                raise ValueError(f"Invalid saved action samples for seed {seed}")
+            actions.append(array)
+        raw = np.stack(actions)
+        pairs, baselines, matrix, max_matrix, distances, half, baseline_values = pairwise_statistics(
+            raw[:, 0], raw[:, 1], settings["spec"])
+        del raw, actions
+        for row in pairs:
+            row["seed_i"], row["seed_j"] = data["seeds"][row["index_i"]], data["seeds"][row["index_j"]]
+        for row in baselines:
+            row["seed"] = data["seeds"][row["index"]]
+        summaries = [seed_summary(root, data, seed, done) for seed, done in zip(data["seeds"], completed)]
+        write_csv(output / "seed_summary.csv", summaries)
+        write_csv(output / "pairwise_w1.csv", pairs)
+        write_csv(output / "independent_sample_baseline.csv", baselines)
+        with (output / "pairwise_grid.csv").open("w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["seed_i", "seed_j", "state", "reward", "step", "w1_mean", "w1_standard_error"])
+            for k, row in enumerate(pairs):
+                for cell, (s, r, t) in enumerate(settings["spec"]["points"]):
+                    writer.writerow([row["seed_i"], row["seed_j"], s, r, t,
+                                     distances[k, :, cell].mean(), se(distances[k, :, cell])])
+        np.savez_compressed(output / "pairwise_measurements.npz", seeds=np.asarray(data["seeds"]),
+                            mean_matrix=matrix, max_matrix=max_matrix, per_pair_replicate_cell=distances,
+                            half_sample_per_pair_replicate_cell=half,
+                            independent_sample_per_seed_replicate_cell=baseline_values)
+        np.save(output / "common_noise_banks.npy", same_noise, allow_pickle=False)
+        plot_heatmaps(output, data, matrix, max_matrix, distances)
+        result = {"seeds": summaries, "pairs": pairs, "sampling_baselines": baselines,
+                  "comparison_settings": settings, "target_sha256": data["target_sha256"],
+                  "checkpoint_choice": data["checkpoint_choice"],
+                  "limits": ["Replicate SE does not remove empirical W1 bias or define a formal confidence interval.",
+                             "Independent-sample baseline is context, not a null threshold for paired comparisons.",
+                             "Grid includes off-trajectory combinations and weights all cells equally.",
+                             "Different actions on the grid do not establish isolated exact stationary points."]}
+        write_json(output / "study_summary.json", result)
+        screened = sum(row["small_gradient_supported"] and not row["descent_detected"] for row in summaries)
+        report = ["# LQ random-seed study", "",
+                  f"{len(summaries)} independent training seeds; one fixed empirical target.",
+                  f"Checkpoint selection: **{data['checkpoint_choice']}**. Compared {len(pairs)} policy pairs.",
+                  f"Fixed grid: {len(settings['spec']['points'])} state/reward/time cells; "
+                  f"{settings['samples']} fresh Gaussian samples per cell; {settings['replicates']} shared banks.",
+                  "", "## Larger checkpoint audits", "",
+                  f"{screened}/{len(summaries)} checkpoints passed the small-gradient screen with no tested descent.",
+                  "This is a numerical screen, not a count of proved stationary points. "
+                  "Inspect reward fit and action stability separately in seed_summary.csv.", "",
+                  "| Seed | Epoch | Reward CF loss | Reward W1 | Gradient screen | Descent detected |",
+                  "|---|---:|---:|---:|---:|---|"]
+        for row in summaries:
+            report.append(f"| {row['seed']} | {row['checkpoint_epoch']} | {row['reward_cf_loss']:.4g} | "
+                          f"{row['reward_w1']:.4g} | {row['gradient_screen']:.4g} | {row['descent_detected']} |")
+        report += ["", "## Pairwise action distances", "",
+                   f"Mean-grid W1 ranges from {min(row['mean'] for row in pairs):.6g} "
+                   f"to {max(row['mean'] for row in pairs):.6g} across distinct pairs.",
+                   "The heatmaps summarize action distributions; per-time and per-cell outputs show where policies differ.",
+                   "pairwise_w1.csv also compares the full sample size with a nested half-sized sample, "
+                   "and records replicate variability. independent_sample_baseline.csv measures two independent "
+                   "samples from each same policy for sampling-error context; it is not a formal test threshold.",
+                   "", "Different neural weights may implement identical policies. Empirical W1 can be positive "
+                   "for equal population distributions. Stable action samples and small gradients are evidence "
+                   "for near-stationary behavior, not proofs of local minima or exactly ten distinct stationary points.",
+                   "", "See study_summary.json, pairwise_grid.csv, and pairwise_measurements.npz for all measurements."]
+        (output / "report.md").write_text("\n".join(report) + "\n")
+        artifacts = [path for path in output.iterdir() if path.is_file() and path.name != "complete.json"]
+        write_json(output / "complete.json", {"pair_count": len(pairs), "seed_count": len(summaries),
+                   "file_sha256": {path.name: digest(path) for path in artifacts}})
+        print(f"Comparison complete: {output / 'report.md'}", flush=True)
+
+
+def run_all(args):
+    _, data = manifest(args.experiment)
+    for index in range(len(data["seeds"])):
+        args.index, args.compare_if_ready = index, False
+        train_seed(args)
+    compare(args)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    commands = parser.add_subparsers(dest="command", required=True)
+    p = commands.add_parser("prepare", help="Freeze settings and a common target; lightweight CPU preparation")
+    p.add_argument("--experiment", required=True)
+    target = p.add_mutually_exclusive_group()
+    target.add_argument("--target-checkpoint", type=Path)
+    target.add_argument("--target-file", type=Path, help="Existing negative reward .npy samples")
+    p.add_argument("--target-seed", type=int, default=102026)
+    p.add_argument("--seeds", default="")
+    p.add_argument("--epochs", type=int, default=400)
+    p.add_argument("--train-batch", type=int, default=8192)
+    p.add_argument("--validation-batch", type=int, default=8192)
+    p.add_argument("--states", default="-0.2,-0.15,-0.1,-0.05,0,0.05,0.1,0.15,0.2")
+    p.add_argument("--rewards", default="-0.15,-0.075,0")
+    p.add_argument("--steps", default="all")
+    p.add_argument("--monitor-samples", type=int, default=512)
+    p.add_argument("--compare-samples", type=int, default=4096)
+    p.add_argument("--compare-replicates", type=int, default=5)
+    p.add_argument("--checkpoint-choice", choices=("best", "last"), default="best")
+    p.add_argument("--smoke", action="store_true", help="Two seeds, tiny networks, 3 epochs; execution check only")
+    for name in ("train", "run", "compare"):
+        p = commands.add_parser(name)
+        p.add_argument("--experiment", required=True)
+        if name != "compare":
+            p.add_argument("--device", default="cuda")
+            p.add_argument("--cpu-threads", type=int, default=4)
+            p.add_argument("--retry", action="store_true", help="Archive incomplete seed output and restart; lock must be absent")
+        if name == "train":
+            p.add_argument("--index", type=int, required=True)
+            p.add_argument("--compare-if-ready", action="store_true")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    {"prepare": prepare, "train": train_seed, "run": run_all, "compare": compare}[args.command](args)
