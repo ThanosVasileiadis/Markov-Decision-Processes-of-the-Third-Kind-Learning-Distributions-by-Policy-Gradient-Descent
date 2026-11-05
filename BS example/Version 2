@@ -1,0 +1,1080 @@
+#!/usr/bin/env python3
+"""Black--Scholes distribution matching, reproducible training, figures and audits.
+
+For parameters check the article 
+
+"""
+from __future__ import annotations
+
+import argparse
+import copy
+import csv
+import hashlib
+import json
+import math
+import os
+import platform
+import random
+import shutil
+import sys
+import time
+from collections import deque
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from torch import nn
+from torch.nn import functional as F
+from torch.nn.utils import parameters_to_vector, vector_to_parameters
+
+SOURCE_URL = ("https://github.com/ThanosVasileiadis/Markov-Decision-Processes-of-the-Third-Kind-"
+              "Learning-Distributions-by-Policy-Gradient-Descent/tree/main/BS%20example")
+SCHEMA_VERSION = 1
+
+
+@dataclass
+class Config:
+    profile: str = "prototype"
+    output: str = "bs_run"
+    scenario: str = "both"
+    seeds: str = "2026"
+    seed: int = 2026
+    target_seed: int = 42
+    device: str = "cuda"
+    cpu_threads: int = 0
+    deterministic: bool = True
+    horizon: int = 20
+    years: float = 1.0
+    s0: float = 100.0
+    risk_free: float = 0.02
+    drift: float = 0.06
+    sigma: float = 0.40
+    target_n: int = 20000
+    target_file: str = ""
+    frequency_cutoff: float = 9.0
+    frequencies: int = 301
+    weight_alpha: float = 0.025
+    quadrature: str = "trapezoid"
+    width: int = 256
+    blocks: int = 4
+    policy_inputs: int = 4
+    zero_output: bool = True
+    output_init_std: float = 0.0
+    state_scale: float = 1.0
+    epochs: int = 400
+    train_batch: int = 2048
+    train_chunk: int = 2048
+    learning_rate: float = 1e-4
+    optimizer: str = "adam"
+    decay_exponent: float = 0.75
+    decay_timescale: float = 100.0
+    early_stop: float = 0.0
+    eval_every: int = 10
+    eval_chunk: int = 4096
+    validation_batch: int = 4096
+    validation_replicates: int = 3
+    test_batch: int = 8192
+    test_replicates: int = 5
+    checkpoint_every: int = 10
+    action_samples: int = 512
+    action_every: int = 1
+    action_states: str = "95,97.5,100,102.5,105"
+    action_steps: str = "0,last"
+    action_lag: int = 10
+    action_seed: int = 7142027
+    figure_samples: int = 10000
+    figure_cf_samples: int = 4096
+    figure_action_samples: int = 20000
+    figure_policy: str = "best"
+    figure_dpi: int = 300
+    audit_batch: int = 1024
+    audit_replicates: int = 12
+    gradient_tolerance: float = 0.05
+    perturbation_scales: str = "0.001,0.003,0.01"
+    perturbation_directions: int = 4
+    perturbation_batch: int = 2048
+    perturbation_replicates: int = 3
+    audit: bool = True
+
+
+def profile_config(name: str) -> Config:
+    cfg = Config(profile=name)
+    if name == "article":
+        # Match the public BS script; the manuscript's generic architecture differs.
+        return replace(cfg, policy_inputs=3, blocks=3, zero_output=False,
+                       train_batch=102400, epochs=201, quadrature="rectangle",
+                       early_stop=1e-3, figure_policy="last")
+    if name == "resolved":
+        # Explicit alternative objective resolving the narrow low-frequency peak.
+        return replace(cfg, frequency_cutoff=0.5, frequencies=1001, state_scale=100.0)
+    if name != "prototype":
+        raise ValueError("profile must be article, prototype, or resolved")
+    return cfg
+
+
+def write_json(path: Path, value) -> None:
+    # JSON output is portable: missing/nonfinite diagnostics are represented by null.
+    def clean(x):
+        if isinstance(x, dict):
+            return {str(k): clean(v) for k, v in x.items()}
+        if isinstance(x, (list, tuple)):
+            return [clean(v) for v in x]
+        if isinstance(x, (np.floating, np.integer)):
+            return clean(x.item())
+        if isinstance(x, float) and not math.isfinite(x):
+            return None
+        return x
+    path.write_text(json.dumps(clean(value), indent=2, allow_nan=False) + "\n")
+
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def load_checkpoint(path) -> dict:
+    # Checkpoints contain optimizer and RNG metadata. Load your own trusted files.
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def validate(cfg: Config) -> None:
+    positive = ("horizon", "target_n", "width", "epochs", "train_batch", "train_chunk",
+                "eval_every", "eval_chunk", "validation_batch", "validation_replicates",
+                "test_batch", "test_replicates", "checkpoint_every", "figure_samples",
+                "figure_cf_samples", "figure_action_samples", "figure_dpi", "audit_batch",
+                "audit_replicates", "perturbation_batch", "perturbation_replicates")
+    if any(getattr(cfg, k) < 1 for k in positive):
+        raise ValueError("Sample counts, intervals, width, horizon and epochs must be positive")
+    if cfg.scenario not in {"full_stock", "uniform", "both"}:
+        raise ValueError("scenario must be full_stock, uniform, or both")
+    if cfg.target_file and cfg.scenario == "both" and "{scenario}" not in cfg.target_file:
+        raise ValueError("For both scenarios, target_file must contain {scenario}")
+    if cfg.frequencies < 3 or cfg.frequencies % 2 != 1:
+        raise ValueError("frequencies must be odd and at least 3")
+    if cfg.blocks < 0 or cfg.policy_inputs not in (3, 4):
+        raise ValueError("blocks must be nonnegative; policy_inputs must be 3 or 4")
+    if not math.isfinite(cfg.output_init_std) or cfg.output_init_std < 0:
+        raise ValueError("output_init_std must be finite and nonnegative")
+    if cfg.zero_output and cfg.output_init_std > 0:
+        raise ValueError("Use --no-zero-output with a positive --output-init-std")
+    if cfg.quadrature not in {"trapezoid", "rectangle"}:
+        raise ValueError("quadrature must be trapezoid or rectangle")
+    if min(cfg.years, cfg.s0, cfg.frequency_cutoff, cfg.learning_rate, cfg.state_scale,
+           cfg.decay_timescale) <= 0 or cfg.sigma < 0 or cfg.weight_alpha < 0:
+        raise ValueError("Invalid model, grid, scaling or learning-rate parameter")
+    if cfg.optimizer not in {"adam", "sgd"}:
+        raise ValueError("optimizer must be adam or sgd")
+    if cfg.optimizer == "sgd" and not 0.5 < cfg.decay_exponent <= 1:
+        raise ValueError("SGD decay_exponent must be in (0.5, 1]")
+    if cfg.early_stop < 0 or cfg.gradient_tolerance < 0 or cfg.perturbation_directions < 0:
+        raise ValueError("Thresholds and perturbation direction count must be nonnegative")
+    if cfg.action_samples < 0 or min(cfg.action_every, cfg.action_lag) < 1:
+        raise ValueError("action_samples must be nonnegative; action intervals positive")
+    if cfg.figure_policy not in {"best", "last"}:
+        raise ValueError("figure_policy must be best or last")
+    probe_spec(cfg)
+    if any(x <= 0 for x in comma_numbers(cfg.perturbation_scales)):
+        raise ValueError("Perturbation scales must be positive")
+    if any(getattr(cfg, k) < 0 for k in ("seed", "target_seed", "action_seed", "cpu_threads")):
+        raise ValueError("Seeds and CPU thread count must be nonnegative")
+    for key, value in asdict(cfg).items():
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(f"Nonfinite config field: {key}")
+
+
+def configure_runtime(cfg: Config) -> torch.device:
+    allocated = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))
+    threads = cfg.cpu_threads or min(4, allocated)
+    if threads > allocated:
+        raise ValueError("cpu_threads exceeds allocated CPUs")
+    torch.set_num_threads(threads)
+    device = torch.device(cfg.device)
+    if device.type not in {"cpu", "cuda"}:
+        raise ValueError("Use cpu, cuda, or cuda:N")
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA unavailable; request a GPU allocation or use --device cpu")
+        torch.cuda.set_device(device.index or 0)
+        device = torch.device("cuda", torch.cuda.current_device())
+    torch.use_deterministic_algorithms(cfg.deterministic)
+    if cfg.deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.backends.cudnn.benchmark = False
+    print(f"PyTorch={torch.__version__} device={device} CPU_threads={threads}", flush=True)
+    return device
+
+
+class Policy(nn.Module):
+    """Implicit distribution over the investment FRACTION pi in (0, 1)."""
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.policy_inputs, self.state_scale = cfg.policy_inputs, cfg.state_scale
+        self.input = nn.Linear(cfg.policy_inputs, cfg.width)
+        self.input_norm = nn.LayerNorm(cfg.width)
+        self.blocks = nn.ModuleList(nn.ModuleDict({
+            "linear": nn.Linear(cfg.width, cfg.width), "norm": nn.LayerNorm(cfg.width)
+        }) for _ in range(cfg.blocks))
+        self.output = nn.Linear(cfg.width, 1)
+        if cfg.zero_output:
+            nn.init.zeros_(self.output.weight)
+            nn.init.zeros_(self.output.bias)
+        elif cfg.output_init_std > 0:
+            # Start near a half-investment policy with input-dependent logits.
+            nn.init.normal_(self.output.weight, mean=0.0, std=cfg.output_init_std)
+            nn.init.zeros_(self.output.bias)
+
+    def forward(self, wealth, reward, noise, time_to_go):
+        values = (wealth / self.state_scale, noise, time_to_go)
+        if self.policy_inputs == 4:
+            values = (wealth / self.state_scale, reward / self.state_scale, noise, time_to_go)
+        h = F.relu(self.input_norm(self.input(torch.cat(values, dim=1))))
+        for block in self.blocks:
+            h = h + F.relu(block["norm"](block["linear"](h)))
+        return torch.sigmoid(self.output(h))
+
+
+def wealth_step(wealth, fraction, market_noise, cfg: Config):
+    dt = cfg.years / cfg.horizon
+    bond = math.exp(cfg.risk_free * dt)
+    excess = torch.expm1((cfg.drift - 0.5 * cfg.sigma ** 2 - cfg.risk_free) * dt
+                         + cfg.sigma * math.sqrt(dt) * market_noise)
+    return bond * wealth * (1 + fraction * excess)
+
+
+def rollout(policy: Policy, n: int, cfg: Config, generator=None) -> torch.Tensor:
+    parameter = next(policy.parameters())
+    opts = {"device": parameter.device, "dtype": parameter.dtype}
+    wealth = torch.full((n, 1), cfg.s0, **opts)
+    reward = torch.zeros_like(wealth)  # No rewards are paid before terminal time.
+    for t in range(cfg.horizon):
+        z = torch.randn(n, 1, generator=generator, **opts)
+        tau = torch.full((n, 1), (cfg.horizon - t) / cfg.horizon, **opts)
+        fraction = policy(wealth, reward, z, tau)
+        eps = torch.randn(n, 1, generator=generator, **opts)
+        wealth = wealth_step(wealth, fraction, eps, cfg)
+    return wealth[:, 0]  # The return is terminal wealth, not a sum of wealth levels.
+
+
+def simulate_target(cfg: Config) -> np.ndarray:
+    """Same array order and RNG as the repository's Data collection script."""
+    if cfg.scenario not in {"full_stock", "uniform"}:
+        raise ValueError("simulate_target requires a single scenario")
+    rng = np.random.default_rng(cfg.target_seed)
+    dt = cfg.years / cfg.horizon
+    eps = rng.standard_normal((cfg.target_n, cfg.horizon))
+    excess = np.expm1((cfg.drift - 0.5 * cfg.sigma**2 - cfg.risk_free) * dt
+                      + cfg.sigma * math.sqrt(dt) * eps)
+    low, high = (1., 1.) if cfg.scenario == "full_stock" else (0., 1.)
+    fractions = rng.uniform(low, high, size=eps.shape)
+    wealth = np.full(cfg.target_n, cfg.s0, dtype=np.float64)
+    for t in range(cfg.horizon):
+        wealth = math.exp(cfg.risk_free * dt) * wealth * (1 + fractions[:, t] * excess[:, t])
+    return wealth
+
+
+def target_samples(cfg: Config) -> np.ndarray:
+    if cfg.target_file:
+        values = np.asarray(np.load(cfg.target_file.format(scenario=cfg.scenario),
+                                    allow_pickle=False), dtype=np.float64).reshape(-1)
+    else:
+        values = simulate_target(cfg)
+    if len(values) < 2 or not np.isfinite(values).all() or np.any(values <= 0):
+        raise ValueError("Target requires at least two finite positive terminal wealth samples")
+    return values
+
+
+def make_grid(cfg: Config):
+    grid = np.linspace(-cfg.frequency_cutoff, cfg.frequency_cutoff, cfg.frequencies)
+    delta = grid[1] - grid[0]
+    weights = np.full_like(grid, delta)
+    if cfg.quadrature == "trapezoid":
+        weights[[0, -1]] *= 0.5
+    return torch.tensor(grid, dtype=torch.float32), torch.tensor(
+        weights * np.exp(-cfg.weight_alpha * grid**2), dtype=torch.float32)
+
+
+def numpy_cf(values, grid, chunk=1024):
+    values, grid = np.asarray(values, dtype=np.float64), np.asarray(grid, dtype=np.float64)
+    total = np.zeros(len(grid), dtype=np.complex128)
+    for start in range(0, len(values), chunk):
+        total += np.exp(1j * values[start:start + chunk, None] * grid).sum(axis=0)
+    return total / len(values)
+
+
+def characteristic_function(values, grid):
+    return torch.exp(1j * values[:, None] * grid[None, :]).mean(0)
+
+
+def cf_loss(values, grid, weights, target_cf):
+    return (weights * (characteristic_function(values, grid) - target_cf).abs().square()).sum()
+
+
+def local_generator(policy, seed):
+    return torch.Generator(device=next(policy.parameters()).device).manual_seed(seed)
+
+
+def training_backward(policy, cfg, grid, weights, target_cf, generator):
+    """One batch = one update, even when trajectories are processed in chunks.
+
+    For a large batch first estimate its full empirical CF without a graph. Replay
+    exactly the same noises and differentiate 2 Re[(phi_hat-target)* d phi_hat].
+    The residual is fixed during replay. This is the ordinary same-batch gradient,
+    NOT a cross-fit or independent-batch training estimator.
+    """
+    policy.zero_grad(set_to_none=True)
+    if cfg.train_batch <= cfg.train_chunk:
+        loss = cf_loss(rollout(policy, cfg.train_batch, cfg, generator), grid, weights, target_cf)
+        loss.backward()
+        return float(loss.detach())
+    before = generator.get_state()
+    phi = torch.zeros_like(target_cf)
+    with torch.no_grad():
+        for start in range(0, cfg.train_batch, cfg.train_chunk):
+            n = min(cfg.train_chunk, cfg.train_batch - start)
+            phi += (n / cfg.train_batch) * characteristic_function(rollout(policy, n, cfg, generator), grid)
+    difference = (phi - target_cf).detach()
+    loss = float((weights * difference.abs().square()).sum())
+    generator.set_state(before)
+    for start in range(0, cfg.train_batch, cfg.train_chunk):
+        n = min(cfg.train_chunk, cfg.train_batch - start)
+        phi_part = characteristic_function(rollout(policy, n, cfg, generator), grid)
+        surrogate = 2 * (n / cfg.train_batch) * (weights * (difference.conj() * phi_part).real).sum()
+        surrogate.backward()
+    return loss
+
+
+@torch.no_grad()
+def sample_outcomes(policy, n, cfg, seed):
+    generator = local_generator(policy, seed)
+    chunks = [rollout(policy, min(cfg.eval_chunk, n - start), cfg, generator).cpu().numpy()
+              for start in range(0, n, cfg.eval_chunk)]
+    result = np.concatenate(chunks)
+    if not np.isfinite(result).all() or np.any(result <= 0):
+        raise FloatingPointError("Nonfinite or nonpositive simulated wealth")
+    return result
+
+
+def evaluate_losses(policy, cfg, grid, weights, target_cf, n, count, seed):
+    u, w, target = (x.detach().cpu().numpy() for x in (grid, weights, target_cf))
+    return [float(np.sum(w * np.abs(numpy_cf(sample_outcomes(policy, n, cfg, seed + k), u)
+                                                  - target)**2)) for k in range(count)]
+
+
+def comma_numbers(value):
+    values = [float(x.strip()) for x in value.split(",")]
+    if not values or not all(math.isfinite(x) for x in values):
+        raise ValueError("Expected a comma-separated list of finite numbers")
+    return values
+
+
+def probe_spec(cfg):
+    states = comma_numbers(cfg.action_states)
+    steps = list(range(cfg.horizon)) if cfg.action_steps == "all" else [
+        cfg.horizon - 1 if t.strip() == "last" else int(t) for t in cfg.action_steps.split(",")]
+    steps = list(dict.fromkeys(steps))
+    if len(set(states)) != len(states) or any(s <= 0 for s in states):
+        raise ValueError("Action wealth states must be distinct and positive")
+    if not steps or any(t < 0 or t >= cfg.horizon for t in steps):
+        raise ValueError("Probe step outside decision times 0,...,horizon-1")
+    return {"states": states, "steps": steps,
+            "points": [[s, t] for t in steps for s in states]}
+
+
+@torch.no_grad()
+def action_samples(policy, cfg, spec, n, seed, sort=True):
+    # CPU-generated, common z across cells/policies; independent of training RNG.
+    noise = torch.randn(n, generator=torch.Generator().manual_seed(seed))
+    parameter = next(policy.parameters())
+    noise = noise.to(device=parameter.device, dtype=parameter.dtype)
+    values = []
+    for wealth, step in spec["points"]:
+        pieces = []
+        for start in range(0, n, cfg.eval_chunk):
+            z = noise[start:start + cfg.eval_chunk, None]
+            s = torch.full_like(z, wealth)
+            tau = torch.full_like(z, (cfg.horizon - step) / cfg.horizon)
+            pieces.append(policy(s, torch.zeros_like(s), z, tau)[:, 0].cpu().numpy())
+        values.append(np.concatenate(pieces))
+    values = np.stack(values)
+    if not np.isfinite(values).all():
+        raise FloatingPointError("Nonfinite action probes")
+    return np.sort(values, axis=1) if sort else values
+
+
+def cpu_state(policy):
+    return {k: v.detach().cpu().clone() for k, v in policy.state_dict().items()}
+
+
+def w1_actions(a, b):
+    return np.abs(a.astype(np.float64) - b.astype(np.float64)).mean(axis=1)
+
+
+class ActionMonitor:
+    def __init__(self, policy, cfg, saved=None):
+        self.cfg, self.spec = cfg, probe_spec(cfg)
+        if saved:
+            self.initial = saved["initial"]
+            self.previous = saved["previous"]
+            self.previous_epoch = saved["previous_epoch"]
+            self.bank = deque(saved["bank"], maxlen=cfg.action_lag + 2)
+            self.previous_state = saved["previous_state"]
+            self.initial_state = saved["initial_state"]
+            self.records = saved["records"]
+            self.predecessor_state = saved["predecessor_state"]
+        else:
+            self.initial = action_samples(policy, cfg, self.spec, cfg.action_samples, cfg.action_seed)
+            self.previous, self.previous_epoch = self.initial, -1
+            self.bank = deque([(-1, self.initial)], maxlen=cfg.action_lag + 2)
+            self.initial_state = self.previous_state = cpu_state(policy)
+            self.predecessor_state, self.records = self.initial_state, []
+
+    def observe(self, policy, epoch):
+        current = action_samples(policy, self.cfg, self.spec, self.cfg.action_samples, self.cfg.action_seed)
+        prior_epoch = self.previous_epoch
+        lag = next((x for e, x in self.bank if e == epoch - self.cfg.action_lag), None)
+        distances = {"previous": w1_actions(current, self.previous),
+                     "initial": w1_actions(current, self.initial),
+                     "lag": w1_actions(current, lag) if lag is not None else None}
+        row = {"epoch": epoch, "previous_epoch": prior_epoch,
+               "epoch_gap": epoch - prior_epoch,
+               "lag_epoch": epoch - self.cfg.action_lag if lag is not None else None}
+        for name, values in distances.items():
+            row[name + "_mean"] = float(values.mean()) if values is not None else None
+            row[name + "_max"] = float(values.max()) if values is not None else None
+            row[name + "_per_cell"] = values.tolist() if values is not None else None
+        self.records.append(row)
+        self.predecessor_state = self.previous_state
+        self.previous_state = cpu_state(policy)
+        self.previous, self.previous_epoch = current, epoch
+        self.bank.append((epoch, current))
+        return row
+
+    def state_dict(self):
+        return {k: getattr(self, k) for k in ("initial", "previous", "previous_epoch", "bank",
+                "previous_state", "initial_state", "predecessor_state", "records")} | {"bank": list(self.bank)}
+
+    def save(self, output):
+        write_json(output / "action_stability_history.json", {"spec": self.spec, "seed": self.cfg.action_seed,
+                                                             "records": self.records})
+        write_csv(output / "action_stability_history.csv", [
+            {k: v for k, v in row.items() if not k.endswith("_per_cell")} for row in self.records])
+        cells = []
+        for row in self.records:
+            for j, (wealth, step) in enumerate(self.spec["points"]):
+                cells.append({"epoch": row["epoch"], "wealth": wealth, "step": step,
+                              **{k: row[k + "_per_cell"][j] if row[k + "_per_cell"] is not None else None
+                                 for k in ("previous", "initial", "lag")}})
+        write_csv(output / "action_stability_grid.csv", cells)
+        fig, axes = plt.subplots(3, 1, figsize=(8, 9), sharex=True)
+        for ax, name in zip(axes, ("initial", "lag", "previous")):
+            for stat in ("mean", "max"):
+                ax.plot([r["epoch"] for r in self.records],
+                        [r[name + "_" + stat] for r in self.records], label=stat)
+            ax.set_ylabel(f"Action W1 vs {name}")
+            ax.set_yscale("symlog", linthresh=1e-6)
+            ax.legend()
+        axes[-1].set_xlabel("Epoch (post-update policy)")
+        fig.tight_layout()
+        save_figure(fig, output / "action_stability_history", self.cfg.figure_dpi)
+
+
+def write_csv(path, rows):
+    if not rows:
+        return
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def analytic_moments(cfg, mean_fraction, second_fraction):
+    """Exact moments for iid fractions independent of wealth and market noise."""
+    dt = cfg.years / cfg.horizon
+    q1 = math.exp((cfg.drift - cfg.risk_free) * dt)
+    q2 = math.exp(2 * (cfg.drift - cfg.risk_free) * dt + cfg.sigma**2 * dt)
+    a = math.exp(cfg.risk_free * dt) * (1 + mean_fraction * (q1 - 1))
+    b = math.exp(2 * cfg.risk_free * dt) * (
+        1 + 2 * mean_fraction * (q1 - 1) + second_fraction * (q2 - 2 * q1 + 1))
+    mean = cfg.s0 * a ** cfg.horizon
+    variance = max(0., cfg.s0**2 * b**cfg.horizon - mean**2)
+    return {"mean": mean, "std": math.sqrt(variance)}
+
+
+def distribution_metrics(target, learned):
+    # Exact empirical W1, including unequal sample sizes, via integrated CDFs.
+    a, b = np.sort(target), np.sort(learned)
+    points = np.sort(np.concatenate((a, b)))
+    fa = np.searchsorted(a, points, side="right") / len(a)
+    fb = np.searchsorted(b, points, side="right") / len(b)
+    return {"w1": float(np.sum(np.abs(fa[:-1] - fb[:-1]) * np.diff(points))),
+            "ks": float(np.max(np.abs(fa - fb))),
+            "target_mean": float(a.mean()), "learned_mean": float(b.mean()),
+            "target_std": float(a.std()), "learned_std": float(b.std()),
+            "target_quantiles_01_05_50_95_99": np.quantile(a, [.01, .05, .5, .95, .99]).tolist(),
+            "learned_quantiles_01_05_50_95_99": np.quantile(b, [.01, .05, .5, .95, .99]).tolist()}
+
+
+def crossfit_gradient(policy, cfg, grid, weights, target_cf):
+    generator = local_generator(policy, cfg.seed + 400000)
+    gradients = []
+    for _ in range(cfg.audit_replicates):
+        with torch.no_grad():
+            phi_a = characteristic_function(rollout(policy, cfg.audit_batch, cfg, generator), grid)
+        phi_b = characteristic_function(rollout(policy, cfg.audit_batch, cfg, generator), grid)
+        surrogate = 2 * (weights * ((phi_a - target_cf).conj() * phi_b).real).sum()
+        policy.zero_grad(set_to_none=True)
+        surrogate.backward()
+        gradients.append(torch.cat([p.grad.flatten().detach() for p in policy.parameters()]))
+    policy.zero_grad(set_to_none=True)
+    matrix = torch.stack(gradients)
+    mean = matrix.mean(0)
+    se = (float(((matrix - mean).square().sum(1).sum() / (len(matrix) - 1) / len(matrix)).sqrt())
+          if len(matrix) > 1 else None)
+    norm = float(mean.norm())
+    upper = norm + se / math.sqrt(.05) if se is not None else None
+    return {"mean_gradient_norm": norm, "gradient_standard_error_norm": se,
+            "plug_in_gradient_norm_screen": upper, "gradient_tolerance": cfg.gradient_tolerance,
+            "small_gradient_supported": upper is not None and upper <= cfg.gradient_tolerance,
+            "replicates": cfg.audit_replicates, "trajectories_per_half_batch": cfg.audit_batch}, mean
+
+
+def perturbation_audit(policy, cfg, grid, weights, target_cf, gradient):
+    base = parameters_to_vector(policy.parameters()).detach().clone()
+    generator = local_generator(policy, cfg.seed + 500000)
+    directions = []
+    if float(gradient.norm()) > 0:
+        directions.append(("measured_gradient", gradient / gradient.norm()))
+    for i in range(cfg.perturbation_directions):
+        z = torch.randn(base.shape, device=base.device, generator=generator)
+        directions.append((f"random_{i}", z / z.norm()))
+    seed = cfg.seed + 510000
+    baseline = np.array(evaluate_losses(policy, cfg, grid, weights, target_cf,
+        cfg.perturbation_batch, cfg.perturbation_replicates, seed))
+    results = []
+    try:
+        for relative_scale in comma_numbers(cfg.perturbation_scales):
+            step = relative_scale * max(float(base.norm()), 1.)
+            for label, direction in directions:
+                for sign in (-1, 1):
+                    vector_to_parameters(base + sign * step * direction, policy.parameters())
+                    changed = np.array(evaluate_losses(policy, cfg, grid, weights, target_cf,
+                        cfg.perturbation_batch, cfg.perturbation_replicates, seed))
+                    delta = changed - baseline
+                    se = float(delta.std(ddof=1) / math.sqrt(len(delta))) if len(delta) > 1 else None
+                    results.append({"relative_scale": relative_scale, "step_norm": step,
+                        "direction": label, "sign": sign, "paired_changes": delta.tolist(),
+                        "mean_change": float(delta.mean()), "standard_error": se,
+                        "detected_descent": se is not None and bool(np.all(delta < 0) and delta.mean() + 4 * se < 0)})
+    finally:
+        vector_to_parameters(base, policy.parameters())
+    return {"results": results, "descent_detected": any(r["detected_descent"] for r in results),
+            "note": "Exploratory screen with paired random streams; no formal confidence guarantee."}
+
+
+def audit_policy(policy, cfg, target, grid, weights, target_cf, output, checkpoint):
+    values = evaluate_losses(policy, cfg, grid, weights, target_cf, cfg.test_batch,
+                             cfg.test_replicates, cfg.seed + 300000)
+    u, w, phi_target = [x.detach().cpu().numpy() for x in (grid, weights, target_cf)]
+    crossfit_values = []
+    for k in range(cfg.test_replicates):
+        a = numpy_cf(sample_outcomes(policy, cfg.test_batch, cfg, cfg.seed + 310000 + 2*k), u)
+        b = numpy_cf(sample_outcomes(policy, cfg.test_batch, cfg, cfg.seed + 310001 + 2*k), u)
+        crossfit_values.append(float(np.sum(w * ((a - phi_target) * (b - phi_target).conj()).real)))
+    grad, mean_grad = crossfit_gradient(policy, cfg, grid, weights, target_cf)
+    geometry = perturbation_audit(policy, cfg, grid, weights, target_cf, mean_grad)
+    torch.save({"mean_gradient": mean_grad.cpu(), "config": asdict(cfg)}, output / "audit_mean_gradient.pt")
+    learned = sample_outcomes(policy, cfg.test_batch, cfg, cfg.seed + 600000)
+    np.save(output / "audit_terminal_wealth.npy", learned)
+    metrics = distribution_metrics(target, learned)
+    # Dense low frequencies expose fits that the coarse historical grid can miss.
+    dense_grid = np.linspace(-.5, .5, 1001)
+    target_dense, learned_dense = numpy_cf(target, dense_grid), numpy_cf(learned, dense_grid)
+    dense_error = np.abs(target_dense - learned_dense)
+    np.savez_compressed(output / "audit_dense_cf.npz", frequencies=dense_grid,
+                        target_cf=target_dense, learned_cf=learned_dense)
+    stability = []
+    saved_monitor = checkpoint.get("action_monitor")
+    if saved_monitor and cfg.action_samples:
+        spec = probe_spec(cfg)
+        for label, state in (("initial", saved_monitor["initial_state"]),
+                             ("previous_monitored", saved_monitor["predecessor_state"])):
+            reference = Policy(cfg).to(next(policy.parameters()).device)
+            reference.load_state_dict(state)
+            comparisons = []
+            for k in range(cfg.test_replicates):
+                seed = cfg.action_seed + 10000000 + k
+                comparisons.append(w1_actions(
+                    action_samples(policy, cfg, spec, cfg.action_samples, seed),
+                    action_samples(reference, cfg, spec, cfg.action_samples, seed)))
+            distance = np.stack(comparisons)
+            stability.append({"reference": label, "mean_w1": float(distance.mean()),
+                              "max_cell_mean_w1": float(distance.mean(0).max()),
+                              "per_cell_replicates": distance.tolist()})
+    verdict = ("Nearby descent detected; a local minimum is not supported." if geometry["descent_detected"]
+               else "Small gradient supported; local-minimum candidate only." if grad["small_gradient_supported"]
+               else "Stationarity is not established.")
+    result = {"checkpoint_epoch": checkpoint["epoch"], "config": asdict(cfg),
+              "fresh_test_loss_mean": float(np.mean(values)), "fresh_test_losses": values,
+              "fresh_test_loss_sd": float(np.std(values, ddof=1)) if len(values)>1 else None,
+              "crossfit_loss_mean": float(np.mean(crossfit_values)),
+              "crossfit_loss_standard_error": float(np.std(crossfit_values, ddof=1)/math.sqrt(len(values))) if len(values)>1 else None,
+              "crossfit_loss_values": crossfit_values,
+              "approximate_matched_sampling_floor": float(np.sum(w * (1 - np.abs(phi_target)**2)) / cfg.test_batch),
+              "distribution": metrics, "gradient_audit": grad, "perturbation_audit": geometry,
+              "dense_low_frequency_cf_max_error": float(dense_error.max()),
+              "dense_low_frequency_cf_mean_square": float(np.mean(dense_error**2)),
+              "action_stability_audit": stability, "verdict": verdict,
+              "baseline_exact_moments": {"full_stock": analytic_moments(cfg, 1, 1),
+                  "uniform_fraction": analytic_moments(cfg, .5, 1/3),
+                  "constant_half_fraction": analytic_moments(cfg, .5, .25)},
+              "limits": ["Fixed empirical target and finite frequency grid.",
+                         "Training uses the usual same-batch squared loss; cross-fitting is for audits.",
+                         "Estimated gradient uncertainty and perturbations are numerical screens, not proofs.",
+                         "A coarse CF grid can miss distribution differences; inspect dense CF and W1.",
+                         "Uniform fractions and constant 0.5 fractions do not have identical terminal laws."]}
+    write_json(output / "summary.json", result)
+    (output / "report.md").write_text(
+        f"# Black--Scholes audit\n\nScenario: {cfg.scenario}; seed: {cfg.seed}; selected epoch: {checkpoint['epoch']}.\n\n"
+        f"Fresh CF loss: {result['fresh_test_loss_mean']:.6g}; empirical W1: {metrics['w1']:.6g}; KS: {metrics['ks']:.6g}.\n\n"
+        f"Dense low-frequency CF max discrepancy: {dense_error.max():.6g}.\n\n{verdict}\n\n"
+        "The cross-fit loss can be negative. Gradient uncertainty is an estimated screen, not a formal confidence interval. "
+        "Action stability alone does not establish stationarity or accurate terminal-wealth matching.\n")
+    return result
+
+
+def save_figure(fig, stem, dpi):
+    fig.savefig(str(stem) + ".png", dpi=dpi)
+    fig.savefig(str(stem) + ".svg")
+    plt.close(fig)
+
+
+def kde_line(ax, values, color):
+    values = np.asarray(values, dtype=np.float64)
+    if values.min() == values.max():
+        return
+    bandwidth = 1.06 * values.std() * len(values)**(-.2)
+    if bandwidth <= 0:
+        return
+    x = np.linspace(values.min() - 3*bandwidth, values.max() + 3*bandwidth, 400)
+    density = np.zeros_like(x)
+    for start in range(0, len(values), 1024):
+        z = (x[:, None] - values[None, start:start+1024]) / bandwidth
+        density += np.exp(-.5*z*z).sum(1)
+    ax.plot(x, density / (len(values)*bandwidth*math.sqrt(2*math.pi)), color=color)
+
+
+def plot_density_histogram(ax, samples, bins=100, **kwargs):
+    """Plot without duplicate float32 bin edges or fabricated sample variance.
+
+    Near-deterministic CUDA policies can produce only one or two distinct float32
+    values. Integer-bin histogram construction can then round multiple edges to
+    the same number. Promote plotting values to float64 and provide strictly
+    increasing explicit edges. Exact point masses are drawn as vertical lines.
+    The original samples, policy and training objective are untouched.
+    """
+    values = np.asarray(samples, dtype=np.float64).reshape(-1)
+    if values.size == 0 or not np.isfinite(values).all():
+        raise ValueError("Histogram samples must be nonempty and finite")
+    if not isinstance(bins, int) or bins < 1:
+        raise ValueError("Histogram bins must be a positive integer")
+    low, high = float(values.min()), float(values.max())
+    if low == high:
+        label = kwargs.get("label")
+        color = kwargs.get("color", f"C{len(ax.lines) % 10}")
+        return ax.axvline(low, color=color,
+                          label=f"{label} (point mass)" if label else "Point mass")
+    edges = np.unique(np.linspace(low, high, bins + 1, dtype=np.float64))
+    return ax.hist(values, bins=edges, density=True, **kwargs)
+
+
+def plot_histogram(ax, target, learned):
+    plot_density_histogram(ax, target, color="blue", alpha=.4, label="Empirical Target")
+    plot_density_histogram(ax, learned, color="red", alpha=.4, label=r"Learned $S_N$")
+    kde_line(ax, target, "blue")
+    kde_line(ax, learned, "red")
+    ax.set_xlabel(r"Terminal Wealth $S_N$")
+    ax.set_ylabel("Density")
+    ax.legend()
+
+
+def plot_cf(axes, grid, target_cf, learned_cf):
+    for ax, component, label in zip(axes, ("real", "imag"), ("Re", "Im")):
+        ax.plot(grid, getattr(target_cf, component), "--", label=f"Target {label} φ")
+        ax.plot(grid, getattr(learned_cf, component), label=f"Learned {label} φ")
+        ax.set_ylabel(f"{label} φ(ω)")
+        ax.legend()
+        ax.grid(True)
+    axes[-1].set_xlabel("ω")
+
+
+def make_figures(policy, cfg, target, grid, target_cf, output, epoch, checkpoint_path=None):
+    """Every curve can be regenerated from figure_data.npz without training."""
+    figures = output / "figures"
+    figures.mkdir(parents=True, exist_ok=True)
+    learned = sample_outcomes(policy, cfg.figure_samples, cfg, cfg.seed + 700000)
+    cf_samples = sample_outcomes(policy, cfg.figure_cf_samples, cfg, cfg.seed + 710000)
+    u = grid.detach().cpu().numpy()
+    target_phi = target_cf.detach().cpu().numpy()
+    learned_phi = numpy_cf(cf_samples, u)
+    spec = {"points": [[s, 0] for s in comma_numbers(cfg.action_states)]}
+    actions = action_samples(policy, cfg, spec, cfg.figure_action_samples, cfg.action_seed + 1000000, sort=False)
+    np.savez_compressed(output / "figure_data.npz", target_terminal_wealth=target,
+                        learned_terminal_wealth=learned, cf_terminal_wealth=cf_samples,
+                        frequencies=u, target_cf=target_phi, learned_cf=learned_phi,
+                        action_points=np.array(spec["points"]), action_fractions=actions,
+                        epoch=epoch, scenario=cfg.scenario)
+    write_json(figures / "manifest.json", {"scenario": cfg.scenario, "checkpoint_epoch": epoch,
+               "training_selection_setting": cfg.figure_policy,
+               "checkpoint_path": str(Path(checkpoint_path).resolve()) if checkpoint_path else None,
+               "checkpoint_sha256": sha256(Path(checkpoint_path)) if checkpoint_path else None,
+               "source_data": "../figure_data.npz",
+               "figure_data_sha256": sha256(output / "figure_data.npz"),
+               "wealth_seed": cfg.seed + 700000, "cf_seed": cfg.seed + 710000,
+               "action_seed": cfg.action_seed + 1000000, "action_time_to_go": 1.0,
+               "note": "New simulation outputs, not the original historical bitmap data."})
+    render_figure_data(output / "figure_data.npz", figures, cfg.figure_dpi)
+
+
+def render_figure_data(path, figures, dpi=300):
+    figures = Path(figures)
+    figures.mkdir(parents=True, exist_ok=True)
+    with np.load(path, allow_pickle=False) as data:
+        full = str(data["scenario"]) == "full_stock"
+        n, action_n = (9, 10) if full else (11, 12)
+        target, learned = data["target_terminal_wealth"], data["learned_terminal_wealth"]
+        fig, ax = plt.subplots(figsize=(10, 5))
+        plot_histogram(ax, target, learned)
+        ax.set_title("Empirical Distribution Comparison: Target vs Learned")
+        fig.tight_layout()
+        save_figure(fig, figures / f"figure_{n:02d}a_histogram", dpi)
+        fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+        plot_cf(axes, data["frequencies"], data["target_cf"], data["learned_cf"])
+        fig.tight_layout()
+        save_figure(fig, figures / f"figure_{n:02d}b_characteristic_functions", dpi)
+        fig = plt.figure(figsize=(13, 5))
+        gs = fig.add_gridspec(2, 2)
+        hist = fig.add_subplot(gs[:, 0])
+        plot_histogram(hist, target, learned)
+        axes = [fig.add_subplot(gs[i, 1]) for i in range(2)]
+        plot_cf(axes, data["frequencies"], data["target_cf"], data["learned_cf"])
+        fig.tight_layout()
+        save_figure(fig, figures / f"figure_{n:02d}_terminal_wealth", dpi)
+        fig, ax = plt.subplots(figsize=(8, 5))
+        rows = []
+        for (wealth, step), samples in zip(data["action_points"], data["action_fractions"]):
+            plot_density_histogram(ax, samples, histtype="step", label=f"s = {wealth:g}")
+            values = np.asarray(samples, dtype=np.float64)
+            rows.append({"wealth": float(wealth), "step": int(step), "mean_fraction": float(values.mean()),
+                         "std_fraction": float(values.std(ddof=1)) if len(values) > 1 else 0.,
+                         "min_fraction": float(values.min()), "max_fraction": float(values.max()),
+                         "unique_values": int(np.unique(values).size), "samples": len(values)})
+        ax.set_title("Action Distributions for Different Wealth States")
+        ax.set_xlabel("Action value (investment fraction)")
+        ax.set_ylabel("Density")
+        ax.legend(title="State")
+        ax.grid(True)
+        fig.tight_layout()
+        save_figure(fig, figures / f"figure_{action_n:02d}_action_distributions", dpi)
+        write_csv(figures / "action_statistics.csv", rows)
+        fig, ax = plt.subplots(figsize=(10, 5))
+        for values, label, color in ((target, "Target ECDF", "blue"), (learned, "Learned ECDF", "red")):
+            ax.step(np.sort(values), np.arange(1, len(values)+1)/len(values), where="post", label=label, color=color)
+        ax.set_xlabel(r"Terminal Wealth $S_N$")
+        ax.set_ylabel("Empirical CDF")
+        ax.legend()
+        ax.grid(True)
+        fig.tight_layout()
+        save_figure(fig, figures / "terminal_wealth_ecdf", dpi)
+
+
+def plot_history(rows, output, dpi):
+    fig, axes = plt.subplots(2, 1, figsize=(8, 7), sharex=True)
+    axes[0].plot([r["epoch"] for r in rows], [r["train_loss"] for r in rows], label="Training batch (pre-update)")
+    valid = [r for r in rows if r["validation_mean"] is not None]
+    axes[0].plot([r["epoch"] for r in valid], [r["validation_mean"] for r in valid], label="Validation (post-update)")
+    axes[0].set_yscale("log")
+    axes[0].set_ylabel("Weighted CF loss")
+    axes[0].legend()
+    axes[1].plot([r["epoch"] for r in rows], [r["gradient_norm"] for r in rows])
+    axes[1].set_yscale("symlog", linthresh=1e-8)
+    axes[1].set_ylabel("Training gradient norm")
+    axes[1].set_xlabel("Epoch")
+    fig.tight_layout()
+    save_figure(fig, output / "history", dpi)
+
+
+def checkpoint_payload(policy, optimizer, cfg, epoch, generator, target, grid,
+                       weights, target_cf, rows, best_loss, best_epoch, monitor):
+    return {"schema_version": SCHEMA_VERSION, "state_dict": cpu_state(policy),
+            "optimizer_state_dict": copy.deepcopy(optimizer.state_dict()),
+            "config": asdict(cfg), "epoch": epoch, "history": copy.deepcopy(rows),
+            "best_validation_mean": best_loss, "best_epoch": best_epoch,
+            "target_samples": torch.from_numpy(target.copy()),
+            "target_cf": target_cf.detach().cpu().clone(),
+            "frequencies": grid.detach().cpu().clone(), "weights": weights.detach().cpu().clone(),
+            "train_generator_state": generator.get_state().cpu(),
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "numpy_rng_state": np.random.get_state(), "python_rng_state": random.getstate(),
+            "action_monitor": copy.deepcopy(monitor.state_dict()) if monitor else None,
+            "source_sha256": sha256(Path(__file__))}
+
+
+def save_checkpoint(path, payload):
+    # Atomic replacement leaves the previous completed checkpoint intact on interruption.
+    payload = copy.deepcopy(payload)
+    def cpu_tensors(value):
+        if torch.is_tensor(value):
+            return value.detach().cpu()
+        if isinstance(value, dict):
+            return {k: cpu_tensors(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [cpu_tensors(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(cpu_tensors(v) for v in value)
+        return value
+    temporary = path.with_suffix(".pt.tmp")
+    torch.save(cpu_tensors(payload), temporary)
+    temporary.replace(path)
+
+
+def load_policy(path, device="cpu"):
+    checkpoint = load_checkpoint(path)
+    if checkpoint.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError("Unsupported BS checkpoint schema")
+    cfg = Config(**checkpoint["config"])
+    policy = Policy(cfg).to(device)
+    policy.load_state_dict(checkpoint["state_dict"])
+    policy.eval()
+    return policy, cfg, checkpoint
+
+
+def runtime_metadata(device, started):
+    result = {"elapsed_seconds": time.perf_counter() - started, "python": platform.python_version(),
+              "torch": torch.__version__, "numpy": np.__version__, "matplotlib": matplotlib.__version__,
+              "device": str(device), "cpu_threads": torch.get_num_threads(),
+              "cuda_runtime": torch.version.cuda, "platform": platform.platform(),
+              "slurm_job_id": os.environ.get("SLURM_JOB_ID")}
+    if device.type == "cuda":
+        result.update(gpu=torch.cuda.get_device_name(device),
+                      peak_allocated_bytes=torch.cuda.max_memory_allocated(device))
+    return result
+
+
+def train(cfg: Config, resume=None):
+    validate(cfg)
+    started = time.perf_counter()
+    device = configure_runtime(cfg)
+    output = Path(cfg.output).expanduser().resolve() / cfg.scenario / f"seed_{cfg.seed}"
+    output.mkdir(parents=True, exist_ok=True)
+    if (output / "last_policy.pt").exists() and resume is None:
+        raise FileExistsError(f"Run exists: {output}. Use --resume-from or a new --output.")
+    if resume is not None and resume.get("source_sha256") != sha256(Path(__file__)):
+        raise ValueError("Code differs from checkpoint source; use its saved source_snapshot.py to resume exactly")
+    if resume is not None and torch.device(resume["config"]["device"]).type != device.type:
+        raise ValueError("Exact resume requires the same device type. Portable evaluation works with --audit-checkpoint or --plot-checkpoint.")
+    torch.manual_seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    random.seed(cfg.seed)
+    policy = Policy(cfg).to(device)
+    optimizer = (torch.optim.Adam if cfg.optimizer == "adam" else torch.optim.SGD)(
+        policy.parameters(), lr=cfg.learning_rate)
+    generator = local_generator(policy, cfg.seed + 100000)
+    target = resume["target_samples"].numpy().copy() if resume else target_samples(cfg)
+    if resume:
+        grid, weights, target_cf = [resume[k].to(device) for k in ("frequencies", "weights", "target_cf")]
+        policy.load_state_dict(resume["state_dict"])
+        optimizer.load_state_dict(resume["optimizer_state_dict"])
+        generator.set_state(resume["train_generator_state"])
+        torch.set_rng_state(resume["torch_rng_state"])
+        if device.type == "cuda" and resume.get("cuda_rng_state_all"):
+            torch.cuda.set_rng_state_all(resume["cuda_rng_state_all"])
+        np.random.set_state(resume["numpy_rng_state"])
+        random.setstate(resume["python_rng_state"])
+        rows = copy.deepcopy(resume["history"])
+        best_loss, best_epoch = resume["best_validation_mean"], resume["best_epoch"]
+        start_epoch = resume["epoch"] + 1
+        if cfg.epochs <= start_epoch:
+            raise ValueError("epochs is the total budget and must exceed the resumed update count")
+        if best_epoch == resume["epoch"] and not (output / "best_policy.pt").exists():
+            save_checkpoint(output / "best_policy.pt", resume)
+        elif not (output / "best_policy.pt").exists():
+            raise ValueError("Resuming into a new folder also requires the historical best_policy.pt; use the original --output")
+    else:
+        grid, weights = make_grid(cfg)
+        target_cf = torch.tensor(numpy_cf(target, grid.numpy()), dtype=torch.complex64)
+        grid, weights, target_cf = grid.to(device), weights.to(device), target_cf.to(device)
+        rows, best_loss, best_epoch, start_epoch = [], math.inf, -1, 0
+    monitor = ActionMonitor(policy, cfg, resume.get("action_monitor") if resume else None) if cfg.action_samples else None
+    np.save(output / "target_samples.npy", target)
+    np.savez_compressed(output / "target_cf.npz", frequencies=grid.cpu().numpy(),
+                        weights=weights.cpu().numpy(), target_cf=target_cf.cpu().numpy())
+    write_json(output / "config.json", asdict(cfg))
+    snapshot = output / "source_snapshot.py"
+    if Path(__file__).resolve() != snapshot.resolve():
+        shutil.copyfile(__file__, snapshot)
+    write_json(output / "provenance.json", {"reference_code": SOURCE_URL,
+        "source_sha256": sha256(Path(__file__)), "target_sha256": sha256(output / "target_samples.npy"),
+        "target_origin": cfg.target_file or f"generated iid {cfg.scenario} fractions; target seed {cfg.target_seed}",
+        "historical_figures_exactly_reconstructed": False,
+        "profile": cfg.profile, "resume_from_epoch": resume["epoch"] if resume else None})
+    if not resume:
+        payload = checkpoint_payload(policy, optimizer, cfg, -1, generator, target, grid,
+                                     weights, target_cf, rows, best_loss, best_epoch, monitor)
+        save_checkpoint(output / "initial_policy.pt", payload)
+    log_path = output / "history.csv"
+    # Reconstruct from checkpoint so a partially written CSV is never trusted on resume.
+    write_csv(log_path, rows)
+    for epoch in range(start_epoch, cfg.epochs):
+        rate = (cfg.learning_rate / (1 + epoch / cfg.decay_timescale)**cfg.decay_exponent
+                if cfg.optimizer == "sgd" else cfg.learning_rate)
+        optimizer.param_groups[0]["lr"] = rate
+        policy.train()
+        loss = training_backward(policy, cfg, grid, weights, target_cf, generator)
+        norm = math.sqrt(sum(float(p.grad.detach().square().sum()) for p in policy.parameters()))
+        if not math.isfinite(loss) or not math.isfinite(norm):
+            raise FloatingPointError(f"Nonfinite training loss/gradient at epoch {epoch}")
+        optimizer.step()
+        policy.eval()
+        stop = cfg.early_stop > 0 and loss < cfg.early_stop
+        evaluation_epoch = epoch % cfg.eval_every == 0 or epoch == cfg.epochs-1 or stop
+        action_record = (monitor.observe(policy, epoch) if monitor and
+                         (epoch % cfg.action_every == 0 or evaluation_epoch) else None)
+        vals = (evaluate_losses(policy, cfg, grid, weights, target_cf, cfg.validation_batch,
+                cfg.validation_replicates, cfg.seed + 200000 + epoch*100) if evaluation_epoch else [])
+        mean = float(np.mean(vals)) if vals else None
+        row = {"epoch": epoch, "train_loss": loss, "gradient_norm": norm, "learning_rate": rate,
+               "validation_mean": mean,
+               "validation_sd": float(np.std(vals, ddof=1)) if len(vals)>1 else 0. if vals else None,
+               "action_w1_previous_mean": action_record["previous_mean"] if action_record else None,
+               "action_w1_previous_max": action_record["previous_max"] if action_record else None,
+               "action_w1_initial_mean": action_record["initial_mean"] if action_record else None,
+               "action_w1_lag_mean": action_record["lag_mean"] if action_record else None}
+        rows.append(row)
+        with log_path.open("a", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(row))
+            if handle.tell() == 0:
+                writer.writeheader()
+            writer.writerow(row)
+            handle.flush()
+        improved = mean is not None and mean < best_loss
+        if improved:
+            best_loss, best_epoch = mean, epoch
+        if improved or (epoch+1) % cfg.checkpoint_every == 0 or epoch == cfg.epochs-1 or stop:
+            payload = checkpoint_payload(policy, optimizer, cfg, epoch, generator, target, grid,
+                                         weights, target_cf, rows, best_loss, best_epoch, monitor)
+            save_checkpoint(output / "last_policy.pt", payload)
+            if improved:
+                save_checkpoint(output / "best_policy.pt", payload)
+            if (epoch+1) % cfg.checkpoint_every == 0 or epoch == cfg.epochs-1 or stop:
+                folder = output / "checkpoints"
+                folder.mkdir(exist_ok=True)
+                save_checkpoint(folder / f"epoch_{epoch:06d}.pt", payload)
+        if evaluation_epoch:
+            print(f"{cfg.scenario} seed={cfg.seed} epoch={epoch} train={loss:.6g} "
+                  f"validation={mean:.6g} gradient={norm:.4g}", flush=True)
+        if stop:
+            break
+    if monitor:
+        monitor.save(output)
+    plot_history(rows, output, cfg.figure_dpi)
+    selected = load_checkpoint(output / f"{cfg.figure_policy}_policy.pt")
+    policy.load_state_dict(selected["state_dict"])
+    make_figures(policy, cfg, target, grid, target_cf, output, selected["epoch"],
+                 output / f"{cfg.figure_policy}_policy.pt")
+    result = (audit_policy(policy, cfg, target, grid, weights, target_cf, output, selected)
+              if cfg.audit else {"audit_performed": False, "checkpoint_epoch": selected["epoch"]})
+    write_json(output / "run_summary.json", {"best_epoch": best_epoch, "best_validation_mean": best_loss,
+               "last_epoch": rows[-1]["epoch"], "figure_policy": cfg.figure_policy,
+               "figure_epoch": selected["epoch"], "stopped_on_training_threshold": stop,
+               "audit_performed": cfg.audit})
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    write_json(output / "runtime.json", runtime_metadata(device, started))
+    print(f"Saved run: {output}", flush=True)
+    return result
+
+
+def inspect_checkpoint(path, cfg, output, figures_only=False):
+    validate(cfg)
+    output = Path(output).expanduser().resolve()
+    if (output / "last_policy.pt").exists():
+        raise ValueError("Choose a separate output directory for an audit")
+    output.mkdir(parents=True, exist_ok=True)
+    device = configure_runtime(cfg)
+    policy, _, checkpoint = load_policy(path, device)
+    target = checkpoint["target_samples"].numpy()
+    grid, weights, target_cf = [checkpoint[k].to(device) for k in ("frequencies", "weights", "target_cf")]
+    make_figures(policy, cfg, target, grid, target_cf, output, checkpoint["epoch"], path)
+    if not figures_only:
+        return audit_policy(policy, cfg, target, grid, weights, target_cf, output, checkpoint)
+
+
+def parse_request(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    for name, field in Config.__dataclass_fields__.items():
+        default = field.default
+        if isinstance(default, bool):
+            parser.add_argument("--" + name.replace("_", "-"), action=argparse.BooleanOptionalAction, default=None)
+        else:
+            parser.add_argument("--" + name.replace("_", "-"), type=type(default), default=None)
+    parser.add_argument("--resume-from")
+    parser.add_argument("--audit-checkpoint")
+    parser.add_argument("--plot-checkpoint")
+    parser.add_argument("--replot-data", help="Regenerate figures directly from figure_data.npz")
+    args = vars(parser.parse_args(argv))
+    modes = {k: args.pop(k) for k in ("resume_from", "audit_checkpoint", "plot_checkpoint", "replot_data")}
+    if sum(bool(v) for v in modes.values()) > 1:
+        parser.error("Choose at most one resume/audit/plot/replot mode")
+    explicit = {k: v for k, v in args.items() if v is not None}
+    path = modes["resume_from"] or modes["audit_checkpoint"] or modes["plot_checkpoint"]
+    if path:
+        cfg = Config(**load_checkpoint(path)["config"])
+        mutable = {"output", "device", "cpu_threads", "epochs", "figure_samples", "figure_cf_samples",
+                   "figure_action_samples", "figure_dpi", "audit_batch", "audit_replicates", "test_batch",
+                   "test_replicates", "gradient_tolerance", "perturbation_scales", "perturbation_directions",
+                   "perturbation_batch", "perturbation_replicates", "audit"}
+        for name, value in explicit.items():
+            if name not in mutable and value != getattr(cfg, name):
+                parser.error(f"Changing {name} changes the experiment; start a new run")
+            setattr(cfg, name, value)
+    else:
+        cfg = profile_config(explicit.get("profile", "prototype"))
+        for name, value in explicit.items():
+            setattr(cfg, name, value)
+    if (modes["audit_checkpoint"] or modes["plot_checkpoint"] or modes["replot_data"]) and "output" not in explicit:
+        parser.error("Specify --output for audit/plot/replot to preserve the training results")
+    return cfg, modes
+
+
+def main(argv=None):
+    cfg, modes = parse_request(argv)
+    if modes["replot_data"]:
+        render_figure_data(modes["replot_data"], Path(cfg.output), cfg.figure_dpi)
+    elif modes["audit_checkpoint"] or modes["plot_checkpoint"]:
+        inspect_checkpoint(modes["audit_checkpoint"] or modes["plot_checkpoint"], cfg,
+                           cfg.output, figures_only=bool(modes["plot_checkpoint"]))
+    elif modes["resume_from"]:
+        train(cfg, resume=load_checkpoint(modes["resume_from"]))
+    else:
+        # Validate before expanding 'both', including its external-target guard.
+        validate(cfg)
+        scenarios = ("full_stock", "uniform") if cfg.scenario == "both" else (cfg.scenario,)
+        seeds = [int(s.strip()) for s in cfg.seeds.split(",")]
+        if not seeds or len(set(seeds)) != len(seeds) or any(seed < 0 for seed in seeds):
+            raise ValueError("seeds must be distinct nonnegative integers")
+        if cfg.seed != 2026 and cfg.seeds == "2026":
+            seeds = [cfg.seed]
+        for scenario in scenarios:
+            for seed in seeds:
+                train(replace(cfg, scenario=scenario, seed=seed))
+
+
+if __name__ == "__main__":
+    main()
